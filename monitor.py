@@ -181,7 +181,7 @@ def check_tickers():
                 print(f"{ticker}: already alerted today, skipping")
                 continue
             company_name, summary = get_ai_summary(ticker, chg, current, prev_close)
-            subject = f"GVE & CDG Alert: {company_name} ({ticker}) is {direction} {abs(chg):.2f}% today"
+            subject = f"Stock Alert: {company_name} ({ticker}) is {direction} {abs(chg):.2f}% today"
             body = (
                 f"{ticker} has moved {chg:+.2f}% from yesterday's close.\n\n"
                 f"Previous close: ${prev_close:.2f}\n"
