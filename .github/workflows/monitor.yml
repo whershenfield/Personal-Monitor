@@ -1,0 +1,38 @@
+name: Stock Monitor
+
+on:
+  workflow_dispatch:  # Lets you trigger it manually from GitHub for testing
+
+jobs:
+  check-stocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Restore alert cache
+        uses: actions/cache@v3
+        with:
+          path: /tmp/alerted_today.json
+          key: alerted-${{ runner.os }}-${{ steps.date.outputs.date }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pytz yfinance
+
+      - name: Run monitor
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN_GITHUB: ${{ secrets.GIST_TOKEN_GITHUB }}
+        run: python monitor.py
