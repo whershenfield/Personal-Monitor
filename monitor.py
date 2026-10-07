@@ -10,6 +10,8 @@ import yfinance as yf
 import pytz
 import requests
 
+from email.mime.text import MIMEText
+
 import config
 
 
