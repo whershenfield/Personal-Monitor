@@ -407,52 +407,25 @@ def get_headlines(ticker, limit=5):
     return out
 
 
-def gather_market_news(limit=10):
-    """Gather and deduplicate broad market headlines."""
+def gather_market_news():
+    print("Gathering market headlines...")
 
-    seen = set()
-    out = []
+    news = []
 
-    sources = [
-        "SPY",
-        "^GSPC",
-        "QQQ",
-        "TLT",
-        "^TNX",
-        "^VIX",
-        "DX-Y.NYB",
-        "GC=F",
-        "CL=F",
-    ]
+    for ticker in ["SPY", "^GSPC", "QQQ", "TLT", "^TNX", "^VIX", "DX-Y.NYB", "GC=F", "CL=F"]:
+        headlines = get_headlines(ticker, limit=5)
 
-    for source in sources:
+        print(f"  {ticker}: {len(headlines)} headlines")
 
-        for headline in get_headlines(
-            source,
-            limit=8,
-        ):
+        for item in headlines:
+            news.append({
+                "ticker": ticker,
+                **item
+            })
 
-            title_key = (
-                headline["title"]
-                .strip()
-                .lower()
-            )
+    print(f"Total market headlines collected: {len(news)}")
 
-            if title_key in seen:
-                continue
-
-            seen.add(
-                title_key
-            )
-
-            out.append(
-                headline
-            )
-
-            if len(out) >= limit:
-                return out
-
-    return out
+    return news
 
 
 # Market and ETF data gathering
