@@ -44,6 +44,9 @@ config.GIST_TOKEN = os.environ.get(
     "GIST_TOKEN_GITHUB", config.GIST_TOKEN
 )
 
+config.TAVILY_API_KEY = os.environ.get(
+    "TAVILY_API_KEY", config.TAVILY_API_KEY
+)
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
