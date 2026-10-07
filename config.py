@@ -4,6 +4,12 @@ GIST_TOKEN = "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"
 
 INDICES = ["^GSPC", "^IXIC", "^RUT", "^DJI", "BZ=F"]
 PORTFOLIO = ["CAUS.TO", "CALV.TO", "VCN.TO", "CADE.TO"]
+PORTFOLIO_WEIGHTS = {
+    "CAUS.TO": 0.35,
+    "CALV.TO": 0.15,
+    "VCN.TO": 0.20,
+    "CADE.TO": 0.30,
+}
 TICKERS = ["EL.PA", "SPGI"]
 
 EMAIL_SENDER = "whershenfield@gmail.com"
