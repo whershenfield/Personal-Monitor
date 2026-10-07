@@ -169,76 +169,8 @@ def gather_group(tickers, with_headlines=False):
 # ------------------------------------------------------------------
 # AI summary — single batched call with citations
 # ------------------------------------------------------------------
-def build_ai_summary(indices, tickers):
-    """
-    Returns dict:
-      {
-        "market_overview": str,
-        "indices":  {ticker: note},
-        "tickers":  {ticker: {"note": str, "cites": [int, ...]}}
-      }
-    where cites are 1-based indices into that ticker's headline list.
-    """
-
-    def fmt_indices(rows):
-        lines = []
-        for r in rows:
-            lines.append(
-                f"{r['ticker']} ({r['name']}) | "
-                f"{r['price']:.2f} | daily {r['daily']:+.2f}% | "
-                f"YTD {r['ytd']:+.2f}%"
-            )
-        return "\n".join(lines)
-
-    def fmt_tickers(rows):
-        lines = []
-        for r in rows:
-            lines.append(
-                f"\n{r['ticker']} ({r['name']}) | "
-                f"{r['price']:.2f} | daily {r['daily']:+.2f}% | "
-                f"YTD {r['ytd']:+.2f}%"
-            )
-            if r["headlines"]:
-                for i, h in enumerate(r["headlines"], start=1):
-                    lines.append(
-                        f"  [{i}] {h['title']} — {h['publisher']}"
-                    )
-            else:
-                lines.append("  (no headlines available)")
-        return "\n".join(lines)
-
-    prompt = (
-        "You are writing a nightly market review email for a retail investor.\n\n"
-        "MARKET DATA (today):\n"
-        f"{fmt_indices(indices)}\n\n"
-        "WATCHLIST (with numbered headlines):\n"
-        f"{fmt_tickers(tickers)}\n\n"
-        "Return ONLY valid JSON matching this schema exactly:\n"
-        "{\n"
-        '  "market_overview": "<2-4 sentence paragraph summarizing the day\'s tape, '
-        'referencing the index moves above. NEVER empty.>",\n'
-        '  "indices": {"<ticker>": "<one-line note, never empty>", ...},\n'
-        '  "tickers": {\n'
-        '    "<ticker>": {"note": "<1-3 sentence note>", "cites": [<int>, ...]},\n'
-        "    ...\n"
-        "  }\n"
-        "}\n\n"
-        "Rules:\n"
-        "- market_overview: MUST be 2-4 sentences. NEVER return an empty string. "
-        "Describe the overall direction, mention at least two named indices, "
-        "and note any obvious sector or macro theme visible in the data.\n"
-        "- indices: every index ticker appears as a key. One sentence each. Never empty.\n"
-        "- tickers: every watchlist ticker appears as a key.\n"
-        "    * If there are headlines, write 1-3 sentences grounded strictly in them.\n"
-        "    * If there are no headlines, write a brief sector/macro observation.\n"
-        "    * If the daily move is small (|daily| < 0.75%) and there is no notable "
-        "      headline, return note = \"\" (empty string) and cites = [].\n"
-        "    * When a claim is supported by a headline, cite it inline as [1], [2], "
-        "      matching the numbered headlines. List those numbers in the cites array.\n"
-        "- Do not invent URLs or publishers. Only cite headline indices you were given.\n"
-        "- No markdown, no commentary outside the JSON."
-    )
-
+def _groq_call(prompt, max_tokens=2000, temperature=0.3):
+    """Single Groq call. Returns parsed dict or None. Logs raw response on failure."""
     groq_url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {config.GROQ_API_KEY}",
@@ -246,32 +178,120 @@ def build_ai_summary(indices, tickers):
     }
     payload = {
         "model": "llama-3.3-70b-versatile",
-        "max_tokens": 2000,
-        "temperature": 0.3,
-        "response_format": {"type": "json_object"},
+        "max_tokens": max_tokens,
+        "temperature": temperature,
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    fallback = {"market_overview": "", "indices": {}, "tickers": {}}
-
     try:
         r = requests.post(groq_url, headers=headers, data=json.dumps(payload))
-        raw = r.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(raw)
     except Exception as e:
-        print(f"AI summary failed: {e}")
-        try:
-            print(f"Raw Groq response: {raw}")
-        except NameError:
-            pass
-        return fallback
+        print(f"Groq request exception: {e}")
+        return None
 
-    # Normalize / validate
+    print(f"Groq HTTP status: {r.status_code}")
+
+    if r.status_code != 200:
+        print(f"Groq error body: {r.text[:1000]}")
+        return None
+
+    try:
+        body = r.json()
+    except Exception as e:
+        print(f"Groq non-JSON body: {r.text[:500]} ({e})")
+        return None
+
+    if "choices" not in body:
+        print(f"Groq response missing 'choices': {json.dumps(body)[:1000]}")
+        return None
+
+    raw = body["choices"][0]["message"]["content"]
+
+    # Strip markdown fences if model added them
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].lstrip()
+    # Trim anything after the last closing brace
+    last_brace = raw.rfind("}")
+    if last_brace != -1:
+        raw = raw[: last_brace + 1]
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Groq JSON parse failed: {e}")
+        print(f"Raw content: {raw[:1000]}")
+        return None
+
+
+def build_ai_summary(indices, tickers):
+    def fmt_indices(rows):
+        return "\n".join(
+            f"{r['ticker']} ({r['name']}) | {r['price']:.2f} | "
+            f"daily {r['daily']:+.2f}% | YTD {r['ytd']:+.2f}%"
+            for r in rows
+        )
+
+    def fmt_tickers(rows):
+        lines = []
+        for r in rows:
+            lines.append(
+                f"\n{r['ticker']} ({r['name']}) | {r['price']:.2f} | "
+                f"daily {r['daily']:+.2f}% | YTD {r['ytd']:+.2f}%"
+            )
+            if r["headlines"]:
+                for i, h in enumerate(r["headlines"], start=1):
+                    lines.append(f"  [{i}] {h['title']} — {h['publisher']}")
+            else:
+                lines.append("  (no headlines available)")
+        return "\n".join(lines)
+
+    prompt = (
+        "You are writing a nightly market review email for a retail investor. "
+        "Respond with a single JSON object only. No prose outside the JSON.\n\n"
+        "MARKET DATA (today):\n"
+        f"{fmt_indices(indices)}\n\n"
+        "WATCHLIST (with numbered headlines):\n"
+        f"{fmt_tickers(tickers)}\n\n"
+        "Required JSON schema:\n"
+        "{\n"
+        '  "market_overview": "2-4 sentence paragraph. Never empty.",\n'
+        '  "indices": {"<ticker>": "<one-line note>", ...},\n'
+        '  "tickers": {\n'
+        '    "<ticker>": {"note": "<1-3 sentences>", "cites": [1, 2]}\n'
+        "  }\n"
+        "}\n\n"
+        "Rules:\n"
+        "- market_overview must be 2-4 sentences, name at least two indices, "
+        "and note a sector or macro theme.\n"
+        "- indices: one sentence per index ticker. Never empty.\n"
+        "- tickers: every watchlist ticker is a key. If headlines exist, write 1-3 "
+        "sentences grounded in them and cite them inline as [1], [2], listing those "
+        "numbers in the cites array. If daily move is under 0.75% and no notable "
+        "headline exists, return note=\"\" and cites=[].\n"
+        "- Never invent sources. Only cite indices provided.\n"
+    )
+
+    parsed = _groq_call(prompt, max_tokens=2000, temperature=0.3)
+
+    if parsed is None:
+        return {
+            "market_overview": (
+                "Market overview unavailable — Groq call failed. "
+                "Check workflow logs for details."
+            ),
+            "indices": {},
+            "tickers": {},
+        }
+
+    # Validate
     overview = (parsed.get("market_overview") or "").strip()
     if not overview:
         overview = (
-            "Market overview unavailable — the model returned an empty "
-            "response. See index rows below for the day's moves."
+            "Market overview unavailable — model returned empty text. "
+            "See index rows for the day's moves."
         )
 
     indices_notes = parsed.get("indices") or {}
@@ -298,7 +318,6 @@ def build_ai_summary(indices, tickers):
         "indices": indices_notes,
         "tickers": ticker_notes,
     }
-
 
 # ------------------------------------------------------------------
 # Email composition
