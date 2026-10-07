@@ -407,13 +407,13 @@ def get_headlines(ticker, limit=5):
     return out
 
 
-def gather_market_news():
+def gather_market_news(limit=5):
     print("Gathering market headlines...")
 
     news = []
 
     for ticker in ["SPY", "^GSPC", "QQQ", "TLT", "^TNX", "^VIX", "DX-Y.NYB", "GC=F", "CL=F"]:
-        headlines = get_headlines(ticker, limit=5)
+        headlines = get_headlines(ticker, limit=limit)
 
         print(f"  {ticker}: {len(headlines)} headlines")
 
