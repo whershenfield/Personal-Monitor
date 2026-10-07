@@ -11,6 +11,7 @@ import pytz
 import requests
 
 from email.mime.text import MIMEText
+from html import escape
 
 import config
 
@@ -1867,28 +1868,38 @@ def compose_email(
 # ==================================================================
 
 def send_email(subject, body):
-    msg = MIMEText(body)
+    """
+    Send the report as HTML using a monospace font so all
+    fixed-width columns remain aligned.
+    """
 
+    html_body = f"""
+    <html>
+        <body>
+            <pre style="
+                font-family: Menlo, Monaco, Consolas, 'Courier New', monospace;
+                font-size: 13px;
+                line-height: 1.45;
+                white-space: pre-wrap;
+            ">{escape(body)}</pre>
+        </body>
+    </html>
+    """
+
+    msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
     msg["From"] = config.EMAIL_SENDER
-    msg["To"] = ", ".join(
-        config.EMAIL_RECIPIENT
-    )
+    msg["To"] = ", ".join(config.EMAIL_RECIPIENT)
 
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465
-    ) as server:
-
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(
             config.EMAIL_SENDER,
             config.EMAIL_PASSWORD
         )
-
         server.sendmail(
             config.EMAIL_SENDER,
             config.EMAIL_RECIPIENT,
-            msg.as_string(),
+            msg.as_string()
         )
 
 
