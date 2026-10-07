@@ -10,6 +10,7 @@ import yfinance as yf
 import pytz
 import requests
 
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 
@@ -24,28 +25,40 @@ import config
 config.EMAIL_SENDER = os.environ.get(
     "EMAIL_SENDER", config.EMAIL_SENDER
 )
+
 config.EMAIL_PASSWORD = os.environ.get(
     "EMAIL_PASSWORD", config.EMAIL_PASSWORD
 )
+
 config.EMAIL_RECIPIENT = os.environ.get(
-    "EMAIL_RECIPIENT", ",".join(config.EMAIL_RECIPIENT)
+    "EMAIL_RECIPIENT",
+    ",".join(config.EMAIL_RECIPIENT)
 ).split(",")
+
 config.GROQ_API_KEY = os.environ.get(
     "GROQ_API_KEY", config.GROQ_API_KEY
 )
+
 config.GIST_ID = os.environ.get(
     "GIST_ID", config.GIST_ID
 )
+
 config.GIST_TOKEN = os.environ.get(
     "GIST_TOKEN_GITHUB", config.GIST_TOKEN
 )
+
 
 MARKET_TZ = pytz.timezone("America/New_York")
 
 
 # Default sector ETF proxies.
-# You can override these from config.py with:
-# SECTOR_ETFS = {"Technology": "XLK", ...}
+# These can be overridden in config.py with:
+#
+# SECTOR_ETFS = {
+#     "Information Technology": "XLK",
+#     ...
+# }
+#
 DEFAULT_SECTOR_ETFS = {
     "Information Technology": "XLK",
     "Communication Services": "XLC",
@@ -62,6 +75,14 @@ DEFAULT_SECTOR_ETFS = {
 
 
 # Default factor/style ETF proxies.
+#
+# These can be overridden in config.py with:
+#
+# FACTOR_ETFS = {
+#     "Growth": "VUG",
+#     ...
+# }
+#
 DEFAULT_FACTOR_ETFS = {
     "Growth": "VUG",
     "Momentum": "MTUM",
@@ -73,26 +94,53 @@ DEFAULT_FACTOR_ETFS = {
 
 
 SECTOR_ETFS = getattr(
-    config, "SECTOR_ETFS", DEFAULT_SECTOR_ETFS
+    config,
+    "SECTOR_ETFS",
+    DEFAULT_SECTOR_ETFS,
 )
 
 FACTOR_ETFS = getattr(
-    config, "FACTOR_ETFS", DEFAULT_FACTOR_ETFS
+    config,
+    "FACTOR_ETFS",
+    DEFAULT_FACTOR_ETFS,
 )
+
+
+# Optional custom company/security names.
+#
+# Example:
+#
+# TICKER_NAMES = {
+#     "AAPL": "Apple Inc.",
+#     "CAUS.TO": "CI U.S. Equity Index ETF",
+# }
+#
+TICKER_NAMES = getattr(
+    config,
+    "TICKER_NAMES",
+    {},
+)
+
 
 # Optional portfolio weights.
 #
-# Example in config.py:
+# Example:
+#
 # PORTFOLIO_WEIGHTS = {
 #     "AAPL": 0.20,
 #     "MSFT": 0.20,
 #     "NVDA": 0.15,
-#     ...
+#     "AMZN": 0.15,
+#     "JPM": 0.15,
+#     "XOM": 0.15,
 # }
 #
-# Weights do not need to total exactly 1.0.
+# If no weights are supplied, the report still shows the
+# daily/YTD movements of each portfolio holding.
 PORTFOLIO_WEIGHTS = getattr(
-    config, "PORTFOLIO_WEIGHTS", {}
+    config,
+    "PORTFOLIO_WEIGHTS",
+    {},
 )
 
 
@@ -101,7 +149,9 @@ PORTFOLIO_WEIGHTS = getattr(
 # ==================================================================
 
 def market_today():
-    """Return the current date in New York time."""
+    """
+    Return the current calendar date in New York time.
+    """
     return datetime.now(MARKET_TZ).date()
 
 
@@ -114,39 +164,57 @@ def next_day(d):
 # ==================================================================
 
 def has_fresh_data(ticker):
-    """Check that the latest Yahoo daily close is today's market date."""
+    """
+    Check whether Yahoo Finance has a daily observation dated today.
+    """
+
     try:
-        hist = yf.Ticker(ticker).history(period="5d")
+        hist = yf.Ticker(ticker).history(
+            period="5d"
+        )
 
         if hist.empty:
             return False
 
         latest_date = hist.index[-1].date()
+
         return latest_date == market_today()
 
     except Exception as e:
-        print(f"Fresh-data check failed for {ticker}: {e}")
+        print(
+            f"Fresh-data check failed for {ticker}: {e}"
+        )
         return False
 
 
 def get_run_state():
     headers = {
-        "Authorization": f"token {config.GIST_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
+        "Authorization": (
+            f"token {config.GIST_TOKEN}"
+        ),
+        "Accept": (
+            "application/vnd.github.v3+json"
+        ),
     }
 
     try:
         r = requests.get(
-            f"https://api.github.com/gists/{config.GIST_ID}",
+            f"https://api.github.com/gists/"
+            f"{config.GIST_ID}",
             headers=headers,
             timeout=15,
         )
     except Exception as e:
-        print(f"Failed to fetch Gist: {e}")
+        print(
+            f"Failed to fetch Gist: {e}"
+        )
         return {}
 
     if r.status_code != 200:
-        print(f"Failed to fetch Gist: {r.status_code}")
+        print(
+            f"Failed to fetch Gist: "
+            f"{r.status_code}"
+        )
         return {}
 
     content = (
@@ -163,20 +231,30 @@ def get_run_state():
 
 
 def already_ran_today():
-    return get_run_state().get("last_run_date") == market_today().isoformat()
+    return (
+        get_run_state().get("last_run_date")
+        == market_today().isoformat()
+    )
 
 
 def mark_run_success():
     headers = {
-        "Authorization": f"token {config.GIST_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
+        "Authorization": (
+            f"token {config.GIST_TOKEN}"
+        ),
+        "Accept": (
+            "application/vnd.github.v3+json"
+        ),
     }
 
     payload = {
         "files": {
             "run_state.json": {
                 "content": json.dumps(
-                    {"last_run_date": market_today().isoformat()}
+                    {
+                        "last_run_date":
+                            market_today().isoformat()
+                    }
                 )
             }
         }
@@ -184,17 +262,23 @@ def mark_run_success():
 
     try:
         r = requests.patch(
-            f"https://api.github.com/gists/{config.GIST_ID}",
+            f"https://api.github.com/gists/"
+            f"{config.GIST_ID}",
             headers=headers,
             data=json.dumps(payload),
             timeout=15,
         )
     except Exception as e:
-        print(f"Failed to save run state: {e}")
+        print(
+            f"Failed to save run state: {e}"
+        )
         return
 
     if r.status_code != 200:
-        print(f"Failed to save run state: {r.status_code}")
+        print(
+            f"Failed to save run state: "
+            f"{r.status_code}"
+        )
 
 
 # ==================================================================
@@ -203,15 +287,27 @@ def mark_run_success():
 
 def get_quote_and_ytd(ticker):
     """
-    Returns:
-        current_close, daily_pct, ytd_pct
-    using daily closing prices rather than fast_info.last_price.
+    Return:
+        current close,
+        daily percentage change,
+        YTD percentage change.
+
+    Uses historical daily closes rather than fast_info so that
+    after-hours movements do not distort the daily return.
     """
+
     try:
         stock = yf.Ticker(ticker)
 
-        start_date = date(market_today().year, 1, 1)
-        end_date = next_day(market_today())
+        start_date = date(
+            market_today().year,
+            1,
+            1,
+        )
+
+        end_date = next_day(
+            market_today()
+        )
 
         hist = stock.history(
             start=start_date.isoformat(),
@@ -219,38 +315,71 @@ def get_quote_and_ytd(ticker):
             auto_adjust=False,
         )
 
-        if hist.empty or len(hist) < 2:
+        if hist.empty:
             return None, None, None
 
-        hist = hist.dropna(subset=["Close"])
+        hist = hist.dropna(
+            subset=["Close"]
+        )
 
         if len(hist) < 2:
             return None, None, None
 
-        current = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2])
-        ytd_start = float(hist["Close"].iloc[0])
+        current = float(
+            hist["Close"].iloc[-1]
+        )
 
-        if prev_close == 0 or ytd_start == 0:
+        prev_close = float(
+            hist["Close"].iloc[-2]
+        )
+
+        ytd_start = float(
+            hist["Close"].iloc[0]
+        )
+
+        if prev_close == 0:
             return None, None, None
 
-        daily_pct = ((current - prev_close) / prev_close) * 100
-        ytd_pct = ((current - ytd_start) / ytd_start) * 100
+        if ytd_start == 0:
+            return None, None, None
 
-        return current, daily_pct, ytd_pct
+        daily_pct = (
+            (current - prev_close)
+            / prev_close
+        ) * 100
+
+        ytd_pct = (
+            (current - ytd_start)
+            / ytd_start
+        ) * 100
+
+        return (
+            current,
+            daily_pct,
+            ytd_pct,
+        )
 
     except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
+        print(
+            f"Error fetching {ticker}: {e}"
+        )
         return None, None, None
 
 
 @lru_cache(maxsize=None)
 def company_name(ticker):
-    try:
-        info = yf.Ticker(ticker).info
-        return info.get("longName") or info.get("shortName") or ticker
-    except Exception:
-        return ticker
+    """
+    Return a display name without calling Yahoo's
+    fundamentals endpoint.
+
+    This avoids quoteSummary 404 errors for certain
+    Canadian securities and other symbols.
+    """
+
+    if ticker in TICKER_NAMES:
+        return TICKER_NAMES[ticker]
+
+    return ticker
 
 
 # ==================================================================
@@ -259,47 +388,86 @@ def company_name(ticker):
 
 def get_headlines(ticker, limit=5):
     """
-    Returns:
-        [{"title": ..., "publisher": ..., "url": ...}, ...]
+    Return:
+        [
+            {
+                "title": "...",
+                "publisher": "...",
+                "url": "..."
+            }
+        ]
     """
+
     try:
-        news = yf.Ticker(ticker).news or []
+        news = (
+            yf.Ticker(ticker).news
+            or []
+        )
+
     except Exception:
         return []
 
     out = []
     seen = set()
 
-    for a in news:
-        content = a.get("content", {}) or {}
+    for article in news:
 
-        title = content.get("title")
+        content = (
+            article.get("content", {})
+            or {}
+        )
+
+        title = content.get(
+            "title"
+        )
+
         if not title:
             continue
 
-        normalized_title = title.strip().lower()
+        title = title.strip()
+
+        normalized_title = (
+            title.lower()
+        )
 
         if normalized_title in seen:
             continue
 
-        seen.add(normalized_title)
+        seen.add(
+            normalized_title
+        )
 
         publisher = (
-            content.get("provider", {}).get("displayName")
-            or a.get("publisher")
+            content.get(
+                "provider",
+                {}
+            ).get(
+                "displayName"
+            )
+            or article.get(
+                "publisher"
+            )
             or "Unknown"
         )
 
         url = (
-            content.get("canonicalUrl", {}).get("url")
-            or content.get("clickThroughUrl", {}).get("url")
-            or a.get("link")
+            content.get(
+                "canonicalUrl",
+                {}
+            ).get("url")
+            or content.get(
+                "clickThroughUrl",
+                {}
+            ).get("url")
+            or article.get(
+                "link"
+            )
             or ""
         )
 
         out.append(
             {
-                "title": title.strip(),
+                "title": title,
                 "publisher": publisher,
                 "url": url,
             }
@@ -313,9 +481,12 @@ def get_headlines(ticker, limit=5):
 
 def gather_market_news(limit=10):
     """
-    Gather broad market headlines from index, rates, commodity,
-    and major market ETFs. Deduplicate by title.
+    Gather broad market headlines from indices,
+    rates, commodities, volatility and major ETFs.
+
+    Deduplicates identical headlines.
     """
+
     seen = set()
     out = []
 
@@ -331,15 +502,29 @@ def gather_market_news(limit=10):
         "CL=F",
     ]
 
-    for src in sources:
-        for h in get_headlines(src, limit=8):
-            title_key = h["title"].strip().lower()
+    for source in sources:
+
+        for headline in get_headlines(
+            source,
+            limit=8,
+        ):
+
+            title_key = (
+                headline["title"]
+                .strip()
+                .lower()
+            )
 
             if title_key in seen:
                 continue
 
-            seen.add(title_key)
-            out.append(h)
+            seen.add(
+                title_key
+            )
+
+            out.append(
+                headline
+            )
 
             if len(out) >= limit:
                 return out
@@ -348,28 +533,44 @@ def gather_market_news(limit=10):
 
 
 # ==================================================================
-# GROUP / DASHBOARD DATA
+# DATA GATHERING
 # ==================================================================
 
-def gather_group(tickers, with_headlines=False):
+def gather_group(
+    tickers,
+    with_headlines=False,
+):
     rows = []
 
-    for t in tickers:
-        current, daily, ytd = get_quote_and_ytd(t)
+    for ticker in tickers:
+
+        current, daily, ytd = (
+            get_quote_and_ytd(
+                ticker
+            )
+        )
 
         if current is None:
-            print(f"Could not fetch data for {t}")
+            print(
+                f"Could not fetch data "
+                f"for {ticker}"
+            )
             continue
 
         rows.append(
             {
-                "ticker": t,
-                "name": company_name(t),
+                "ticker": ticker,
+                "name": company_name(
+                    ticker
+                ),
                 "price": current,
                 "daily": daily,
                 "ytd": ytd,
                 "headlines": (
-                    get_headlines(t, limit=5)
+                    get_headlines(
+                        ticker,
+                        limit=5,
+                    )
                     if with_headlines
                     else []
                 ),
@@ -381,16 +582,24 @@ def gather_group(tickers, with_headlines=False):
 
 def gather_labeled_etfs(mapping):
     """
-    Used for sectors and factor/style proxies.
-    Returns label, ticker, daily %, YTD %.
+    Gather performance for sector/factor ETF proxies.
     """
+
     rows = []
 
     for label, ticker in mapping.items():
-        current, daily, ytd = get_quote_and_ytd(ticker)
+
+        current, daily, ytd = (
+            get_quote_and_ytd(
+                ticker
+            )
+        )
 
         if current is None:
-            print(f"Could not fetch ETF data for {label} ({ticker})")
+            print(
+                f"Could not fetch ETF data "
+                f"for {label} ({ticker})"
+            )
             continue
 
         rows.append(
@@ -407,15 +616,20 @@ def gather_labeled_etfs(mapping):
 
 
 # ==================================================================
-# PORTFOLIO HELPERS
+# PORTFOLIO
 # ==================================================================
 
-def calculate_weighted_portfolio_return(rows, field):
+def calculate_weighted_portfolio_return(
+    rows,
+    field,
+):
     """
-    Optional weighted portfolio return.
+    Calculate a weighted portfolio return.
 
-    Returns None if no valid weights are available.
+    Returns None if portfolio weights have not been
+    supplied or no valid weights match the holdings.
     """
+
     if not PORTFOLIO_WEIGHTS:
         return None
 
@@ -423,20 +637,34 @@ def calculate_weighted_portfolio_return(rows, field):
     total_weight = 0.0
 
     for row in rows:
+
         ticker = row["ticker"]
         value = row.get(field)
-        weight = PORTFOLIO_WEIGHTS.get(ticker)
+        weight = (
+            PORTFOLIO_WEIGHTS.get(
+                ticker
+            )
+        )
 
-        if value is None or weight is None:
+        if value is None:
             continue
 
-        weighted_sum += value * weight
+        if weight is None:
+            continue
+
+        weighted_sum += (
+            value * weight
+        )
+
         total_weight += weight
 
     if total_weight == 0:
         return None
 
-    return weighted_sum / total_weight
+    return (
+        weighted_sum
+        / total_weight
+    )
 
 
 # ==================================================================
@@ -445,36 +673,58 @@ def calculate_weighted_portfolio_return(rows, field):
 
 def get_fred_series(series_id):
     """
-    Pull the latest two available observations from FRED's public CSV.
-    No API key is required.
+    Pull the two latest observations from FRED's
+    public CSV endpoint.
+
+    No FRED API key is required.
     """
+
     url = (
         "https://fred.stlouisfed.org/graph/"
         f"fredgraph.csv?id={series_id}"
     )
 
     try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
+        response = requests.get(
+            url,
+            timeout=15,
+        )
 
-        reader = csv.DictReader(io.StringIO(r.text))
+        response.raise_for_status()
+
+        reader = csv.DictReader(
+            io.StringIO(
+                response.text
+            )
+        )
 
         observations = []
 
         for row in reader:
-            raw_value = row.get(series_id)
 
-            if raw_value in (None, "", "."):
+            raw_value = row.get(
+                series_id
+            )
+
+            if raw_value in (
+                None,
+                "",
+                ".",
+            ):
                 continue
 
             try:
-                value = float(raw_value)
+                value = float(
+                    raw_value
+                )
             except ValueError:
                 continue
 
             observations.append(
                 {
-                    "date": row.get("observation_date"),
+                    "date": row.get(
+                        "observation_date"
+                    ),
                     "value": value,
                 }
             )
@@ -482,17 +732,28 @@ def get_fred_series(series_id):
         if len(observations) < 2:
             return None
 
-        return observations[-2], observations[-1]
+        return (
+            observations[-2],
+            observations[-1],
+        )
 
     except Exception as e:
-        print(f"FRED {series_id} failed: {e}")
+        print(
+            f"FRED {series_id} failed: {e}"
+        )
         return None
 
 
 def gather_macro_data():
     """
-    Returns a cross-asset macro snapshot including:
-    2Y / 10Y / 30Y yields, DXY, gold, WTI, and VIX.
+    Gather:
+        - 2Y Treasury
+        - 10Y Treasury
+        - 30Y Treasury
+        - DXY
+        - Gold
+        - WTI Crude
+        - VIX
     """
 
     data = {
@@ -500,15 +761,23 @@ def gather_macro_data():
         "cross_asset": [],
     }
 
-    # Treasury yields from FRED
+    # --------------------------------------------------------------
+    # Treasury rates
+    # --------------------------------------------------------------
+
     treasury_series = {
         "2Y Treasury": "DGS2",
         "10Y Treasury": "DGS10",
         "30Y Treasury": "DGS30",
     }
 
-    for label, series_id in treasury_series.items():
-        result = get_fred_series(series_id)
+    for label, series_id in (
+        treasury_series.items()
+    ):
+
+        result = get_fred_series(
+            series_id
+        )
 
         if not result:
             continue
@@ -516,8 +785,9 @@ def gather_macro_data():
         previous, latest = result
 
         change_bps = (
-            (latest["value"] - previous["value"]) * 100
-        )
+            latest["value"]
+            - previous["value"]
+        ) * 100
 
         data["rates"].append(
             {
@@ -528,7 +798,10 @@ def gather_macro_data():
             }
         )
 
-    # Cross-asset market data from Yahoo Finance
+    # --------------------------------------------------------------
+    # Cross-asset markets
+    # --------------------------------------------------------------
+
     cross_asset_map = {
         "DXY": "DX-Y.NYB",
         "Gold": "GC=F",
@@ -536,8 +809,15 @@ def gather_macro_data():
         "VIX": "^VIX",
     }
 
-    for label, ticker in cross_asset_map.items():
-        current, daily, ytd = get_quote_and_ytd(ticker)
+    for label, ticker in (
+        cross_asset_map.items()
+    ):
+
+        current, daily, ytd = (
+            get_quote_and_ytd(
+                ticker
+            )
+        )
 
         if current is None:
             continue
@@ -556,27 +836,44 @@ def gather_macro_data():
 
 
 # ==================================================================
-# LOOKAHEAD
+# LOOKING AHEAD
 # ==================================================================
 
 def normalize_date_value(value):
     if value is None:
         return None
 
-    if isinstance(value, datetime):
+    if isinstance(
+        value,
+        datetime,
+    ):
         return value.date()
 
-    if isinstance(value, date):
+    if isinstance(
+        value,
+        date,
+    ):
         return value
 
-    # Handles pandas Timestamp without importing pandas explicitly.
-    if hasattr(value, "to_pydatetime"):
+    if hasattr(
+        value,
+        "to_pydatetime",
+    ):
         try:
-            return value.to_pydatetime().date()
+            return (
+                value
+                .to_pydatetime()
+                .date()
+            )
         except Exception:
             pass
 
-    if hasattr(value, "date") and callable(value.date):
+    if hasattr(
+        value,
+        "date",
+    ) and callable(
+        value.date
+    ):
         try:
             return value.date()
         except Exception:
@@ -587,44 +884,81 @@ def normalize_date_value(value):
 
 def extract_earnings_dates(calendar):
     """
-    Handles common yfinance calendar formats.
+    Handle common yfinance earnings calendar formats.
     """
+
     results = []
 
     if calendar is None:
         return results
 
-    # Dict format
-    if isinstance(calendar, dict):
-        raw = calendar.get("Earnings Date")
+    # Dictionary format
+    if isinstance(
+        calendar,
+        dict,
+    ):
+
+        raw = calendar.get(
+            "Earnings Date"
+        )
 
         if raw is None:
             return results
 
-        if not isinstance(raw, (list, tuple)):
+        if not isinstance(
+            raw,
+            (list, tuple),
+        ):
             raw = [raw]
 
         for value in raw:
-            d = normalize_date_value(value)
-            if d:
-                results.append(d)
+
+            parsed = (
+                normalize_date_value(
+                    value
+                )
+            )
+
+            if parsed:
+                results.append(
+                    parsed
+                )
 
         return results
 
     # DataFrame-like format
     try:
-        if hasattr(calendar, "index") and "Earnings Date" in calendar.index:
-            row = calendar.loc["Earnings Date"]
 
-            if hasattr(row, "tolist"):
+        if (
+            hasattr(calendar, "index")
+            and
+            "Earnings Date" in calendar.index
+        ):
+
+            row = calendar.loc[
+                "Earnings Date"
+            ]
+
+            if hasattr(
+                row,
+                "tolist",
+            ):
                 values = row.tolist()
             else:
                 values = [row]
 
             for value in values:
-                d = normalize_date_value(value)
-                if d:
-                    results.append(d)
+
+                parsed = (
+                    normalize_date_value(
+                        value
+                    )
+                )
+
+                if parsed:
+                    results.append(
+                        parsed
+                    )
 
     except Exception:
         pass
@@ -634,42 +968,87 @@ def extract_earnings_dates(calendar):
 
 def gather_lookahead():
     """
-    Pull upcoming tracked-company earnings plus recent macro headlines
-    relevant to the coming week.
+    Gather:
+        - upcoming earnings for tracked securities
+        - macro-related headlines for context
     """
+
     lookahead = {
         "earnings": [],
         "macro": [],
     }
 
     today = market_today()
-    horizon = today + timedelta(days=7)
 
-    # Avoid duplicated tickers
-    tracked_for_earnings = list(
-        dict.fromkeys(config.TICKERS + config.PORTFOLIO)
+    horizon = (
+        today
+        + timedelta(days=7)
     )
 
-    for t in tracked_for_earnings:
-        try:
-            cal = yf.Ticker(t).calendar
-            earnings_dates = extract_earnings_dates(cal)
+    # --------------------------------------------------------------
+    # Earnings
+    # --------------------------------------------------------------
 
-            for ed in earnings_dates:
-                if today <= ed <= horizon:
-                    lookahead["earnings"].append(
+    tracked_for_earnings = list(
+        dict.fromkeys(
+            config.TICKERS
+            + config.PORTFOLIO
+        )
+    )
+
+    for ticker in tracked_for_earnings:
+
+        try:
+
+            calendar = (
+                yf.Ticker(
+                    ticker
+                ).calendar
+            )
+
+            earnings_dates = (
+                extract_earnings_dates(
+                    calendar
+                )
+            )
+
+            for earnings_date in (
+                earnings_dates
+            ):
+
+                if (
+                    today
+                    <= earnings_date
+                    <= horizon
+                ):
+
+                    lookahead[
+                        "earnings"
+                    ].append(
                         {
-                            "ticker": t,
-                            "name": company_name(t),
-                            "date": ed.isoformat(),
+                            "ticker":
+                                ticker,
+                            "name":
+                                company_name(
+                                    ticker
+                                ),
+                            "date":
+                                earnings_date.isoformat(),
                         }
                     )
+
                     break
 
         except Exception as e:
-            print(f"Calendar check failed for {t}: {e}")
+            print(
+                f"Calendar check failed "
+                f"for {ticker}: {e}"
+            )
 
-    # Recent macro headlines for context.
+    # --------------------------------------------------------------
+    # Macro headlines
+    # --------------------------------------------------------------
+
     macro_keywords = [
         "fed",
         "inflation",
@@ -696,9 +1075,17 @@ def gather_lookahead():
 
     seen = set()
 
-    for src in macro_sources:
-        for h in get_headlines(src, limit=10):
-            title_lower = h["title"].lower()
+    for source in macro_sources:
+
+        for headline in get_headlines(
+            source,
+            limit=10,
+        ):
+
+            title_lower = (
+                headline["title"]
+                .lower()
+            )
 
             if not any(
                 keyword in title_lower
@@ -706,15 +1093,28 @@ def gather_lookahead():
             ):
                 continue
 
-            title_key = h["title"].lower()
+            title_key = (
+                headline["title"]
+                .strip()
+                .lower()
+            )
 
             if title_key in seen:
                 continue
 
-            seen.add(title_key)
-            lookahead["macro"].append(h)
+            seen.add(
+                title_key
+            )
 
-            if len(lookahead["macro"]) >= 6:
+            lookahead[
+                "macro"
+            ].append(
+                headline
+            )
+
+            if len(
+                lookahead["macro"]
+            ) >= 6:
                 return lookahead
 
     return lookahead
@@ -724,19 +1124,32 @@ def gather_lookahead():
 # GROQ
 # ==================================================================
 
-def _groq_call(prompt, max_tokens=6000, temperature=0.3):
+def _groq_call(
+    prompt,
+    max_tokens=6500,
+    temperature=0.3,
+):
     """
-    Single Groq call. Returns parsed dict or None.
+    Make a single Groq API call and return
+    the parsed JSON response.
     """
-    groq_url = "https://api.groq.com/openai/v1/chat/completions"
+
+    groq_url = (
+        "https://api.groq.com/openai/v1/"
+        "chat/completions"
+    )
 
     headers = {
-        "Authorization": f"Bearer {config.GROQ_API_KEY}",
+        "Authorization": (
+            f"Bearer {config.GROQ_API_KEY}"
+        ),
         "Content-Type": "application/json",
     }
 
     payload = {
-        "model": "openai/gpt-oss-120b",
+        "model": (
+            "openai/gpt-oss-120b"
+        ),
         "max_tokens": max_tokens,
         "temperature": temperature,
         "messages": [
@@ -748,69 +1161,142 @@ def _groq_call(prompt, max_tokens=6000, temperature=0.3):
     }
 
     try:
-        r = requests.post(
+
+        response = requests.post(
             groq_url,
             headers=headers,
             data=json.dumps(payload),
             timeout=120,
         )
+
     except Exception as e:
-        print(f"Groq request exception: {e}")
+        print(
+            f"Groq request exception: {e}"
+        )
         return None
 
-    print(f"Groq HTTP status: {r.status_code}")
+    print(
+        f"Groq HTTP status: "
+        f"{response.status_code}"
+    )
 
-    if r.status_code != 200:
-        print(f"Groq error body: {r.text[:1000]}")
+    if response.status_code != 200:
+
+        print(
+            "Groq error body: "
+            f"{response.text[:1000]}"
+        )
+
         return None
 
     try:
-        body = r.json()
+
+        body = response.json()
+
     except Exception as e:
+
         print(
-            f"Groq non-JSON body: {r.text[:500]} ({e})"
+            "Groq non-JSON body: "
+            f"{response.text[:500]} "
+            f"({e})"
         )
+
         return None
 
-    if "choices" not in body or not body["choices"]:
+    if (
+        "choices" not in body
+        or not body["choices"]
+    ):
+
         print(
-            "Groq response missing choices: "
-            f"{json.dumps(body)[:1000]}"
+            "Groq response missing "
+            f"'choices': {json.dumps(body)[:1000]}"
         )
+
         return None
 
-    raw = body["choices"][0]["message"]["content"].strip()
+    raw = (
+        body["choices"][0]
+        ["message"]
+        ["content"]
+        .strip()
+    )
 
-    # Remove markdown code fences if returned.
+    # --------------------------------------------------------------
+    # Remove markdown code fences
+    # --------------------------------------------------------------
+
     if raw.startswith("```"):
+
         lines = raw.splitlines()
 
-        if lines and lines[0].strip().startswith("```"):
+        if (
+            lines
+            and
+            lines[0]
+            .strip()
+            .startswith("```")
+        ):
             lines = lines[1:]
 
-        if lines and lines[-1].strip() == "```":
+        if (
+            lines
+            and
+            lines[-1]
+            .strip()
+            == "```"
+        ):
             lines = lines[:-1]
 
-        raw = "\n".join(lines).strip()
+        raw = "\n".join(
+            lines
+        ).strip()
 
-    # Try to isolate the JSON object.
-    first_brace = raw.find("{")
-    last_brace = raw.rfind("}")
+    # --------------------------------------------------------------
+    # Extract JSON object
+    # --------------------------------------------------------------
 
-    if first_brace != -1 and last_brace != -1:
-        raw = raw[first_brace:last_brace + 1]
+    first_brace = raw.find(
+        "{"
+    )
+
+    last_brace = raw.rfind(
+        "}"
+    )
+
+    if (
+        first_brace != -1
+        and
+        last_brace != -1
+    ):
+
+        raw = raw[
+            first_brace:
+            last_brace + 1
+        ]
 
     try:
-        return json.loads(raw)
+
+        return json.loads(
+            raw
+        )
 
     except json.JSONDecodeError as e:
-        print(f"Groq JSON parse failed: {e}")
-        print(f"Raw content: {raw[:2000]}")
+
+        print(
+            f"Groq JSON parse failed: {e}"
+        )
+
+        print(
+            "Raw content: "
+            f"{raw[:2000]}"
+        )
+
         return None
 
 
 # ==================================================================
-# AI SUMMARY
+# AI ANALYSIS
 # ==================================================================
 
 def build_ai_summary(
@@ -823,70 +1309,112 @@ def build_ai_summary(
     market_news,
     lookahead,
 ):
+
+    # --------------------------------------------------------------
+    # Formatting helpers for prompt
+    # --------------------------------------------------------------
+
     def fmt_indices(rows):
+
         return "\n".join(
-            f"{r['ticker']} ({r['name']}) | "
-            f"daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%"
+            f"{r['ticker']} "
+            f"({r['name']}) | "
+            f"daily "
+            f"{r['daily']:+.2f}% | "
+            f"YTD "
+            f"{r['ytd']:+.2f}%"
             for r in rows
         )
 
     def fmt_sectors(rows):
+
         return "\n".join(
-            f"{r['label']} ({r['ticker']}) | "
-            f"daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%"
+            f"{r['label']} "
+            f"({r['ticker']}) | "
+            f"daily "
+            f"{r['daily']:+.2f}% | "
+            f"YTD "
+            f"{r['ytd']:+.2f}%"
             for r in rows
         )
 
     def fmt_factors(rows):
+
         return "\n".join(
-            f"{r['label']} ({r['ticker']}) | "
-            f"daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%"
+            f"{r['label']} "
+            f"({r['ticker']}) | "
+            f"daily "
+            f"{r['daily']:+.2f}% | "
+            f"YTD "
+            f"{r['ytd']:+.2f}%"
             for r in rows
         )
 
     def fmt_tickers(rows):
+
         lines = []
 
         for r in rows:
+
             lines.append(
-                f"\n{r['ticker']} ({r['name']}) | "
-                f"daily {r['daily']:+.2f}% | "
-                f"YTD {r['ytd']:+.2f}%"
+                f"\n{r['ticker']} "
+                f"({r['name']}) | "
+                f"daily "
+                f"{r['daily']:+.2f}% | "
+                f"YTD "
+                f"{r['ytd']:+.2f}%"
             )
 
             if r["headlines"]:
-                for i, h in enumerate(
+
+                for i, headline in enumerate(
                     r["headlines"],
-                    start=1
+                    start=1,
                 ):
+
                     lines.append(
-                        f"  [{i}] {h['title']} — "
-                        f"{h['publisher']}"
+                        f"  [{i}] "
+                        f"{headline['title']} "
+                        f"— {headline['publisher']}"
                     )
+
             else:
+
                 lines.append(
-                    "  (no company-specific headlines available)"
+                    "  (no company-specific "
+                    "headlines available)"
                 )
 
         return "\n".join(lines)
 
     def fmt_portfolio(rows):
+
         return "\n".join(
-            f"{r['ticker']} ({r['name']}) | "
-            f"daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%"
+            f"{r['ticker']} "
+            f"({r['name']}) | "
+            f"daily "
+            f"{r['daily']:+.2f}% | "
+            f"YTD "
+            f"{r['ytd']:+.2f}%"
             for r in rows
         )
 
-    def fmt_macro(m):
+    def fmt_macro(macro_data):
+
         lines = []
 
-        if m.get("rates"):
-            lines.append("TREASURY RATES")
-            for r in m["rates"]:
+        if macro_data.get(
+            "rates"
+        ):
+
+            lines.append(
+                "TREASURY RATES"
+            )
+
+            for r in (
+                macro_data["rates"]
+            ):
+
                 lines.append(
                     f"{r['label']} | "
                     f"{r['value']:.2f}% | "
@@ -894,84 +1422,153 @@ def build_ai_summary(
                     f"as of {r['as_of']}"
                 )
 
-        if m.get("cross_asset"):
-            lines.append("\nCROSS-ASSET")
-            for r in m["cross_asset"]:
-                lines.append(
-                    f"{r['label']} | "
-                    f"value {r['value']:.2f} | "
-                    f"daily {r['daily']:+.2f}% | "
-                    f"YTD {r['ytd']:+.2f}%"
-                )
+        if macro_data.get(
+            "cross_asset"
+        ):
 
-        return "\n".join(lines) if lines else "(no macro data)"
-
-    def fmt_news(rows):
-        lines = []
-
-        for i, h in enumerate(rows, start=1):
             lines.append(
-                f"[{i}] {h['title']} — {h['publisher']}"
+                "\nCROSS-ASSET"
             )
 
-        return "\n".join(lines) if lines else "(no market headlines)"
+            for r in (
+                macro_data[
+                    "cross_asset"
+                ]
+            ):
 
-    def fmt_lookahead(la):
+                lines.append(
+                    f"{r['label']} | "
+                    f"value "
+                    f"{r['value']:.2f} | "
+                    f"daily "
+                    f"{r['daily']:+.2f}% | "
+                    f"YTD "
+                    f"{r['ytd']:+.2f}%"
+                )
+
+        if not lines:
+            return "(no macro data)"
+
+        return "\n".join(lines)
+
+    def fmt_news(rows):
+
+        if not rows:
+            return (
+                "(no market headlines)"
+            )
+
+        return "\n".join(
+            f"[{i}] "
+            f"{h['title']} "
+            f"— {h['publisher']}"
+            for i, h in enumerate(
+                rows,
+                start=1,
+            )
+        )
+
+    def fmt_lookahead(lookahead_data):
+
         lines = []
 
-        if la["earnings"]:
-            lines.append("UPCOMING EARNINGS")
-            for e in sorted(
-                la["earnings"],
-                key=lambda x: x["date"]
+        if lookahead_data[
+            "earnings"
+        ]:
+
+            lines.append(
+                "UPCOMING EARNINGS"
+            )
+
+            for earnings in sorted(
+                lookahead_data[
+                    "earnings"
+                ],
+                key=lambda x: x["date"],
             ):
+
                 lines.append(
-                    f"{e['date']}: {e['ticker']} "
-                    f"({e['name']})"
+                    f"{earnings['date']}: "
+                    f"{earnings['ticker']} "
+                    f"({earnings['name']})"
                 )
 
-        if la["macro"]:
-            lines.append("\nRECENT MACRO HEADLINES")
-            for h in la["macro"]:
+        if lookahead_data[
+            "macro"
+        ]:
+
+            lines.append(
+                "\nRECENT MACRO HEADLINES"
+            )
+
+            for headline in (
+                lookahead_data["macro"]
+            ):
+
                 lines.append(
-                    f"- {h['title']} — {h['publisher']}"
+                    f"- "
+                    f"{headline['title']} "
+                    f"— "
+                    f"{headline['publisher']}"
                 )
 
-        return "\n".join(lines) if lines else "(no lookahead data)"
+        if not lines:
+            return "(no lookahead data)"
 
-    portfolio_daily = calculate_weighted_portfolio_return(
-        portfolio, "daily"
+        return "\n".join(lines)
+
+    portfolio_daily = (
+        calculate_weighted_portfolio_return(
+            portfolio,
+            "daily",
+        )
     )
 
-    portfolio_ytd = calculate_weighted_portfolio_return(
-        portfolio, "ytd"
+    portfolio_ytd = (
+        calculate_weighted_portfolio_return(
+            portfolio,
+            "ytd",
+        )
     )
 
-    portfolio_summary = (
-        f"Weighted portfolio daily return: "
-        f"{portfolio_daily:+.2f}%\n"
-        f"Weighted portfolio YTD return: "
-        f"{portfolio_ytd:+.2f}%"
-        if portfolio_daily is not None
-        and portfolio_ytd is not None
-        else
-        "No portfolio weights supplied; "
-        "use holdings-level portfolio movements only."
-    )
+    if (
+        portfolio_daily is not None
+        and
+        portfolio_ytd is not None
+    ):
+
+        portfolio_summary = (
+            "Weighted portfolio daily return: "
+            f"{portfolio_daily:+.2f}%\n"
+            "Weighted portfolio YTD return: "
+            f"{portfolio_ytd:+.2f}%"
+        )
+
+    else:
+
+        portfolio_summary = (
+            "No portfolio weights supplied; "
+            "use holdings-level portfolio "
+            "movements only."
+        )
+
+    # --------------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------------
 
     prompt = f"""
 You are writing a professional daily investment review for someone
 building experience for a career in wealth management and asset management.
 
-The report should read like a concise internal investment note:
+The report should resemble a concise internal investment note:
 data first, analysis second, implications third.
 
 Respond with ONE JSON OBJECT ONLY.
 Do not include markdown outside the JSON.
 
-========================
+==================================================
 MARKET DATA
-========================
+==================================================
 
 INDICES:
 {fmt_indices(indices)}
@@ -990,27 +1587,27 @@ PORTFOLIO MOVEMENTS:
 
 {portfolio_summary}
 
-========================
+==================================================
 MACRO / CROSS-ASSET
-========================
+==================================================
 
 {fmt_macro(macro)}
 
-========================
+==================================================
 MARKET HEADLINES
-========================
+==================================================
 
 {fmt_news(market_news)}
 
-========================
+==================================================
 LOOKING AHEAD DATA
-========================
+==================================================
 
 {fmt_lookahead(lookahead)}
 
-========================
+==================================================
 REQUIRED JSON
-========================
+==================================================
 
 {{
   "executive_summary": [
@@ -1055,15 +1652,15 @@ REQUIRED JSON
   "bottom_line": "<2-4 sentence final assessment>"
 }}
 
-========================
+==================================================
 RULES
-========================
+==================================================
 
 EXECUTIVE SUMMARY
 - Write 4-5 bullets.
 - Summarize the most important developments across equities,
   rates, macro, sectors, factors and cross-asset markets.
-- Do NOT simply repeat every number.
+- Do not simply repeat every number.
 - Each bullet should communicate a meaningful takeaway.
 
 TICKER REVIEW
@@ -1073,7 +1670,7 @@ TICKER REVIEW
   products, regulation, industry developments, or other
   identifiable catalysts.
 - If headlines exist, ground the summary in those headlines.
-- Cite headline numbers from that ticker's headline list.
+- Cite relevant headline numbers from the ticker's headline list.
 - If no relevant headline exists, explicitly say that no material
   company-specific headline was surfaced in the available feed.
 - Do not fabricate company events, facts or sources.
@@ -1082,28 +1679,28 @@ TICKER REVIEW
 MARKET STORIES
 - Select up to 5 of the most important DISTINCT stories.
 - Each summary should be roughly 180-250 words.
-- These should be meaningfully larger than the ticker summaries.
-- Explain what actually happened, relevant context, why it matters,
+- These summaries should be meaningfully larger than ticker summaries.
+- Explain what happened, relevant context, why it matters,
   and what investors should monitor next.
 - Do NOT duplicate the ticker-review content.
-- Do NOT simply restate index, sector, factor, Treasury, commodity,
-  or portfolio movements already shown elsewhere.
+- Do NOT simply restate index, sector, factor, Treasury,
+  commodity or portfolio movements already shown elsewhere.
 - Prefer stories involving macro developments, policy, geopolitics,
-  market structure, major industry developments, or material
-  developments that affect multiple assets.
+  market structure, major industry developments, or developments
+  affecting multiple assets.
 - A company-specific story can be used only when it adds material
   information not already covered in the ticker review.
 - Never invent facts or sources.
-- source_index must correspond to the numbered MARKET HEADLINES list.
+- source_index MUST correspond to the numbered MARKET HEADLINES list.
 
 INVESTMENT IMPLICATIONS
-- Bull case: the strongest arguments supporting current conditions.
-- Bear case: the strongest risks or challenges.
+- Bull case: strongest arguments supporting current conditions.
+- Bear case: strongest risks or challenges.
 - Key question: one specific question that should guide monitoring.
-- These should be analytical rather than repeating the news.
+- These should be analytical rather than repetitive.
 
 LOOKING AHEAD
-- Mention specific upcoming earnings where available.
+- Mention specific upcoming tracked-company earnings where available.
 - Mention specific macro developments only when visible in the
   supplied lookahead data.
 - Explain what matters and why, rather than providing only a calendar.
@@ -1123,6 +1720,7 @@ BOTTOM LINE
     )
 
     if parsed is None:
+
         return {
             "executive_summary": [],
             "tickers": {},
@@ -1136,305 +1734,845 @@ BOTTOM LINE
             "bottom_line": "",
         }
 
-    # ------------------------------
+    # --------------------------------------------------------------
     # Executive summary
-    # ------------------------------
-    executive_summary = parsed.get(
-        "executive_summary"
-    ) or []
+    # --------------------------------------------------------------
 
-    if not isinstance(executive_summary, list):
+    executive_summary = (
+        parsed.get(
+            "executive_summary"
+        )
+        or []
+    )
+
+    if not isinstance(
+        executive_summary,
+        list,
+    ):
         executive_summary = []
 
     executive_summary = [
-        str(x).strip()
-        for x in executive_summary
-        if str(x).strip()
+        str(item).strip()
+        for item in executive_summary
+        if str(item).strip()
     ][:5]
 
-    # ------------------------------
+    # --------------------------------------------------------------
     # Ticker summaries
-    # ------------------------------
-    ticker_notes_raw = parsed.get("tickers") or {}
+    # --------------------------------------------------------------
+
+    ticker_notes_raw = (
+        parsed.get("tickers")
+        or {}
+    )
+
     ticker_notes = {}
 
-    if isinstance(ticker_notes_raw, dict):
-        for k, v in ticker_notes_raw.items():
+    if isinstance(
+        ticker_notes_raw,
+        dict,
+    ):
 
-            if isinstance(v, dict):
+        for ticker, value in (
+            ticker_notes_raw.items()
+        ):
+
+            if isinstance(
+                value,
+                dict,
+            ):
+
                 note = str(
-                    v.get("note") or ""
+                    value.get(
+                        "note"
+                    )
+                    or ""
                 ).strip()
 
-                cites = v.get("cites") or []
+                cites = (
+                    value.get(
+                        "cites"
+                    )
+                    or []
+                )
 
-                if not isinstance(cites, list):
+                if not isinstance(
+                    cites,
+                    list,
+                ):
                     cites = []
 
                 cites = [
-                    c for c in cites
-                    if isinstance(c, int)
+                    c
+                    for c in cites
+                    if isinstance(
+                        c,
+                        int
+                    )
                 ]
 
             else:
+
                 note = (
-                    str(v).strip()
-                    if isinstance(v, str)
+                    str(value).strip()
+                    if isinstance(
+                        value,
+                        str,
+                    )
                     else ""
                 )
+
                 cites = []
 
-            ticker_notes[k] = {
+            ticker_notes[
+                ticker
+            ] = {
                 "note": note,
                 "cites": cites,
             }
 
-    # ------------------------------
-    # Stories
-    # ------------------------------
-    stories_raw = parsed.get("stories") or []
+    # --------------------------------------------------------------
+    # Market stories
+    # --------------------------------------------------------------
+
+    stories_raw = (
+        parsed.get("stories")
+        or []
+    )
+
     stories = []
 
-    if isinstance(stories_raw, list):
+    if isinstance(
+        stories_raw,
+        list,
+    ):
 
-        for s in stories_raw[:5]:
+        for story in stories_raw[:5]:
 
-            if not isinstance(s, dict):
+            if not isinstance(
+                story,
+                dict,
+            ):
                 continue
 
             stories.append(
                 {
                     "title": str(
-                        s.get("title") or ""
+                        story.get(
+                            "title"
+                        )
+                        or ""
                     ).strip(),
 
                     "summary": str(
-                        s.get("summary") or ""
+                        story.get(
+                            "summary"
+                        )
+                        or ""
                     ).strip(),
 
-                    "source_index": s.get(
-                        "source_index"
-                    ),
+                    "source_index":
+                        story.get(
+                            "source_index"
+                        ),
                 }
             )
 
-    # ------------------------------
+    # --------------------------------------------------------------
     # Investment implications
-    # ------------------------------
+    # --------------------------------------------------------------
+
     implications_raw = (
-        parsed.get("investment_implications")
+        parsed.get(
+            "investment_implications"
+        )
         or {}
     )
 
     if not isinstance(
-        implications_raw, dict
+        implications_raw,
+        dict,
     ):
         implications_raw = {}
 
-    bull_case = implications_raw.get(
-        "bull_case"
-    ) or []
+    bull_case = (
+        implications_raw.get(
+            "bull_case"
+        )
+        or []
+    )
 
-    bear_case = implications_raw.get(
-        "bear_case"
-    ) or []
+    bear_case = (
+        implications_raw.get(
+            "bear_case"
+        )
+        or []
+    )
 
-    if not isinstance(bull_case, list):
+    if not isinstance(
+        bull_case,
+        list,
+    ):
         bull_case = []
 
-    if not isinstance(bear_case, list):
+    if not isinstance(
+        bear_case,
+        list,
+    ):
         bear_case = []
 
     investment_implications = {
         "bull_case": [
-            str(x).strip()
-            for x in bull_case
-            if str(x).strip()
+            str(item).strip()
+            for item in bull_case
+            if str(item).strip()
         ][:3],
 
         "bear_case": [
-            str(x).strip()
-            for x in bear_case
-            if str(x).strip()
+            str(item).strip()
+            for item in bear_case
+            if str(item).strip()
         ][:3],
 
         "key_question": str(
             implications_raw.get(
                 "key_question"
-            ) or ""
+            )
+            or ""
         ).strip(),
     }
 
+    # --------------------------------------------------------------
+    # Looking ahead
+    # --------------------------------------------------------------
+
     looking_ahead = str(
-        parsed.get("looking_ahead") or ""
+        parsed.get(
+            "looking_ahead"
+        )
+        or ""
     ).strip()
 
+    # --------------------------------------------------------------
+    # Bottom line
+    # --------------------------------------------------------------
+
     bottom_line = str(
-        parsed.get("bottom_line") or ""
+        parsed.get(
+            "bottom_line"
+        )
+        or ""
     ).strip()
 
     return {
-        "executive_summary": executive_summary,
-        "tickers": ticker_notes,
-        "stories": stories,
-        "investment_implications": investment_implications,
-        "looking_ahead": looking_ahead,
-        "bottom_line": bottom_line,
+        "executive_summary":
+            executive_summary,
+
+        "tickers":
+            ticker_notes,
+
+        "stories":
+            stories,
+
+        "investment_implications":
+            investment_implications,
+
+        "looking_ahead":
+            looking_ahead,
+
+        "bottom_line":
+            bottom_line,
     }
 
 
 # ==================================================================
-# EMAIL FORMATTING
+# HTML HELPERS
 # ==================================================================
 
-def wrap_text(text, width=78):
-    words = text.split()
-    lines = []
-    line = ""
-
-    for word in words:
-
-        if len(line) + len(word) + 1 > width:
-            if line:
-                lines.append(line)
-            line = word
-        else:
-            line = f"{line} {word}".strip()
-
-    if line:
-        lines.append(line)
-
-    return lines
-
-
-def _fmt_quote_row(r):
-    arrow = "▲" if r["daily"] >= 0 else "▼"
-
-    ticker = r["ticker"][:8]
-    name = r["name"][:24]
-
-    return (
-        f"{ticker:<8} "
-        f"{name:<24} "
-        f"{r['daily']:>8.2f}% {arrow}   "
-        f"YTD {r['ytd']:>8.2f}%"
+def html_escape(value):
+    return escape(
+        str(value),
+        quote=True,
     )
 
 
-def _fmt_labeled_row(r):
-    arrow = "▲" if r["daily"] >= 0 else "▼"
+def pct_class(value):
+    if value > 0:
+        return "positive"
+
+    if value < 0:
+        return "negative"
+
+    return "neutral"
+
+
+def format_pct(value):
+    return f"{value:+.2f}%"
+
+
+def build_quote_table(
+    rows,
+    include_price=False,
+):
+    """
+    Build HTML table for indices,
+    tickers and portfolio holdings.
+
+    Names are never truncated.
+    """
+
+    if not rows:
+        return (
+            "<p>Unavailable.</p>"
+        )
+
+    html = [
+        '<table class="data-table">'
+    ]
+
+    html.append(
+        "<thead>"
+        "<tr>"
+        "<th>Ticker</th>"
+        "<th>Name</th>"
+    )
+
+    if include_price:
+        html.append(
+            "<th>Price</th>"
+        )
+
+    html.append(
+        "<th>Daily</th>"
+        "<th>YTD</th>"
+        "</tr>"
+        "</thead>"
+    )
+
+    html.append(
+        "<tbody>"
+    )
+
+    for row in rows:
+
+        daily = row["daily"]
+        ytd = row["ytd"]
+
+        html.append(
+            "<tr>"
+        )
+
+        html.append(
+            f"<td class=\"ticker\">"
+            f"{html_escape(row['ticker'])}"
+            f"</td>"
+        )
+
+        html.append(
+            f"<td class=\"name\">"
+            f"{html_escape(row['name'])}"
+            f"</td>"
+        )
+
+        if include_price:
+
+            html.append(
+                f"<td class=\"number\">"
+                f"{row['price']:.2f}"
+                f"</td>"
+            )
+
+        html.append(
+            f"<td class=\"number "
+            f"{pct_class(daily)}\">"
+            f"{format_pct(daily)}"
+            f"</td>"
+        )
+
+        html.append(
+            f"<td class=\"number "
+            f"{pct_class(ytd)}\">"
+            f"{format_pct(ytd)}"
+            f"</td>"
+        )
+
+        html.append(
+            "</tr>"
+        )
+
+    html.append(
+        "</tbody>"
+        "</table>"
+    )
+
+    return "".join(html)
+
+
+def build_labeled_table(rows):
+    """
+    Build HTML table for sectors/factors.
+    """
+
+    if not rows:
+        return (
+            "<p>Unavailable.</p>"
+        )
+
+    html = [
+        '<table class="data-table">'
+    ]
+
+    html.append(
+        "<thead>"
+        "<tr>"
+        "<th>Category</th>"
+        "<th>Ticker</th>"
+        "<th>Daily</th>"
+        "<th>YTD</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+    )
+
+    for row in rows:
+
+        daily = row["daily"]
+        ytd = row["ytd"]
+
+        html.append(
+            "<tr>"
+            f"<td class=\"name\">"
+            f"{html_escape(row['label'])}"
+            f"</td>"
+            f"<td class=\"ticker\">"
+            f"{html_escape(row['ticker'])}"
+            f"</td>"
+            f"<td class=\"number "
+            f"{pct_class(daily)}\">"
+            f"{format_pct(daily)}"
+            f"</td>"
+            f"<td class=\"number "
+            f"{pct_class(ytd)}\">"
+            f"{format_pct(ytd)}"
+            f"</td>"
+            "</tr>"
+        )
+
+    html.append(
+        "</tbody>"
+        "</table>"
+    )
+
+    return "".join(html)
+
+
+def build_macro_table(macro):
+    html = ""
+
+    # --------------------------------------------------------------
+    # Treasury rates
+    # --------------------------------------------------------------
+
+    if macro.get(
+        "rates"
+    ):
+
+        html += (
+            "<h2>Treasury Rates</h2>"
+        )
+
+        html += """
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Rate</th>
+                    <th>Yield</th>
+                    <th>Daily Change</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        for row in macro[
+            "rates"
+        ]:
+
+            change = row[
+                "daily_bps"
+            ]
+
+            html += (
+                "<tr>"
+                f"<td class=\"name\">"
+                f"{html_escape(row['label'])}"
+                f"</td>"
+                f"<td class=\"number\">"
+                f"{row['value']:.2f}%"
+                f"</td>"
+                f"<td class=\"number "
+                f"{pct_class(change)}\">"
+                f"{change:+.1f} bps"
+                f"</td>"
+                "</tr>"
+            )
+
+        html += (
+            "</tbody>"
+            "</table>"
+        )
+
+    # --------------------------------------------------------------
+    # Cross asset
+    # --------------------------------------------------------------
+
+    if macro.get(
+        "cross_asset"
+    ):
+
+        html += (
+            "<h2>Cross-Asset</h2>"
+        )
+
+        html += """
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Asset</th>
+                    <th>Value</th>
+                    <th>Daily</th>
+                    <th>YTD</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        for row in macro[
+            "cross_asset"
+        ]:
+
+            daily = row[
+                "daily"
+            ]
+
+            ytd = row[
+                "ytd"
+            ]
+
+            html += (
+                "<tr>"
+                f"<td class=\"name\">"
+                f"{html_escape(row['label'])}"
+                f"</td>"
+                f"<td class=\"number\">"
+                f"{row['value']:.2f}"
+                f"</td>"
+                f"<td class=\"number "
+                f"{pct_class(daily)}\">"
+                f"{format_pct(daily)}"
+                f"</td>"
+                f"<td class=\"number "
+                f"{pct_class(ytd)}\">"
+                f"{format_pct(ytd)}"
+                f"</td>"
+                "</tr>"
+            )
+
+        html += (
+            "</tbody>"
+            "</table>"
+        )
 
     return (
-        f"{r['label']:<24} "
-        f"{r['daily']:>+7.2f}% {arrow}   "
-        f"YTD {r['ytd']:>+7.2f}%"
+        html
+        or "<p>Unavailable.</p>"
     )
 
 
-def _fmt_macro_data(macro):
-    lines = []
+def build_bullet_list(items):
+    if not items:
+        return (
+            "<p>Unavailable.</p>"
+        )
 
-    if macro.get("rates"):
-        lines.append("TREASURY RATES")
-        lines.append("-" * 60)
+    html = "<ul>"
 
-        for r in macro["rates"]:
-            arrow = "▲" if r["daily_bps"] >= 0 else "▼"
-
-            lines.append(
-                f"{r['label']:<18} "
-                f"{r['value']:>6.2f}%   "
-                f"{r['daily_bps']:>+6.1f} bps {arrow}"
-            )
-
-        lines.append("")
-
-    if macro.get("cross_asset"):
-        lines.append("CROSS-ASSET")
-        lines.append("-" * 60)
-
-        for r in macro["cross_asset"]:
-            arrow = "▲" if r["daily"] >= 0 else "▼"
-
-            lines.append(
-                f"{r['label']:<18} "
-                f"{r['value']:>10.2f}   "
-                f"{r['daily']:>+7.2f}% {arrow}   "
-                f"YTD {r['ytd']:>+7.2f}%"
-            )
-
-        lines.append("")
-
-    return lines
-
-
-def _fmt_ticker_block(r, ai_entry):
-    header = _fmt_quote_row(r)
-
-    note = (
-        ai_entry or {}
-    ).get("note", "").strip()
-
-    cites = (
-        ai_entry or {}
-    ).get("cites", []) or []
-
-    lines = [header]
-
-    if note:
-        for paragraph_line in wrap_text(
-            note,
-            width=74
-        ):
-            lines.append(
-                f"    {paragraph_line}"
-            )
-
-    cited_headlines = []
-
-    for idx in cites:
-
-        if 1 <= idx <= len(r["headlines"]):
-            cited_headlines.append(
-                r["headlines"][idx - 1]
-            )
-
-    if cited_headlines:
-        lines.append("    Sources:")
-
-        for h in cited_headlines:
-            publisher = h.get(
-                "publisher",
-                "Unknown"
-            )
-
-            url = h.get("url", "")
-
-            if url:
-                lines.append(
-                    f"      • {publisher} — {url}"
-                )
-            else:
-                lines.append(
-                    f"      • {publisher}"
-                )
-
-    return "\n".join(lines)
-
-
-def add_bullets(parts, items, indent="• "):
     for item in items:
-        for i, line in enumerate(
-            wrap_text(item)
+
+        html += (
+            f"<li>"
+            f"{html_escape(item)}"
+            f"</li>"
+        )
+
+    html += "</ul>"
+
+    return html
+
+
+def build_source_link(
+    headline
+):
+    publisher = html_escape(
+        headline.get(
+            "publisher",
+            "Unknown"
+        )
+    )
+
+    url = headline.get(
+        "url",
+        ""
+    )
+
+    if url:
+
+        return (
+            '<p class="source">'
+            'Source: '
+            f'<a href="{html_escape(url)}">'
+            f'{publisher}'
+            '</a>'
+            '</p>'
+        )
+
+    return (
+        '<p class="source">'
+        f"Source: {publisher}"
+        "</p>"
+    )
+
+
+def build_ticker_review(
+    tickers,
+    ai,
+):
+    """
+    Detailed company-by-company review.
+
+    Full names are preserved.
+    """
+
+    ticker_ai = ai.get(
+        "tickers",
+        {}
+    )
+
+    html = ""
+
+    for row in tickers:
+
+        ticker = html_escape(
+            row["ticker"]
+        )
+
+        name = html_escape(
+            row["name"]
+        )
+
+        entry = ticker_ai.get(
+            row["ticker"],
+            {}
+        )
+
+        if not isinstance(
+            entry,
+            dict,
         ):
-            if i == 0:
-                parts.append(
-                    f"{indent}{line}"
+            entry = {}
+
+        note = str(
+            entry.get(
+                "note",
+                ""
+            )
+            or ""
+        ).strip()
+
+        cites = (
+            entry.get(
+                "cites",
+                []
+            )
+            or []
+        )
+
+        html += (
+            '<div class="ticker-review">'
+        )
+
+        html += (
+            f"<h2>"
+            f"{ticker} — {name}"
+            f"</h2>"
+        )
+
+        if note:
+
+            html += (
+                f"<p>"
+                f"{html_escape(note)}"
+                f"</p>"
+            )
+
+        cited_headlines = []
+
+        if isinstance(
+            cites,
+            list,
+        ):
+
+            for index in cites:
+
+                if (
+                    isinstance(
+                        index,
+                        int,
+                    )
+                    and
+                    1 <= index <= len(
+                        row["headlines"]
+                    )
+                ):
+
+                    cited_headlines.append(
+                        row[
+                            "headlines"
+                        ][index - 1]
+                    )
+
+        if cited_headlines:
+
+            html += (
+                "<h3>Sources</h3>"
+            )
+
+            for headline in (
+                cited_headlines
+            ):
+
+                html += (
+                    build_source_link(
+                        headline
+                    )
                 )
-            else:
-                parts.append(
-                    f"  {line}"
+
+        html += (
+            "</div>"
+        )
+
+    return (
+        html
+        or "<p>Unavailable.</p>"
+    )
+
+
+def build_market_stories(
+    market_news,
+    ai,
+):
+    stories = ai.get(
+        "stories",
+        []
+    )
+
+    if not stories:
+        return (
+            "<p>Unavailable.</p>"
+        )
+
+    html = ""
+
+    for story in stories:
+
+        title = html_escape(
+            str(
+                story.get(
+                    "title",
+                    ""
                 )
+                or ""
+            ).strip()
+        )
+
+        summary = str(
+            story.get(
+                "summary",
+                ""
+            )
+            or ""
+        ).strip()
+
+        source_index = story.get(
+            "source_index"
+        )
+
+        if title:
+
+            html += (
+                f"<h2>{title}</h2>"
+            )
+
+        if summary:
+
+            # Preserve paragraphs if the model
+            # returns blank lines.
+            paragraphs = [
+                p.strip()
+                for p in summary.split(
+                    "\n\n"
+                )
+                if p.strip()
+            ]
+
+            for paragraph in paragraphs:
+
+                html += (
+                    f"<p>"
+                    f"{html_escape(paragraph)}"
+                    f"</p>"
+                )
+
+        if (
+            isinstance(
+                source_index,
+                int,
+            )
+            and
+            1 <= source_index
+            <= len(market_news)
+        ):
+
+            html += (
+                build_source_link(
+                    market_news[
+                        source_index - 1
+                    ]
+                )
+            )
+
+    return html
+
+
+def build_paragraph(
+    text
+):
+    if not text:
+        return (
+            "<p>Unavailable.</p>"
+        )
+
+    paragraphs = [
+        p.strip()
+        for p in text.split(
+            "\n\n"
+        )
+        if p.strip()
+    ]
+
+    return "".join(
+        f"<p>{html_escape(p)}</p>"
+        for p in paragraphs
+    )
 
 
 # ==================================================================
@@ -1454,453 +2592,602 @@ def compose_email(
 ):
     now = datetime.now(
         MARKET_TZ
-    ).strftime("%A, %B %d, %Y")
+    ).strftime(
+        "%A, %B %d, %Y"
+    )
 
-    parts = [
-        f"DAILY INVESTMENT REVIEW — {now}",
-        "=" * 60,
-        "",
-    ]
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
 
-    # ==============================================================
-    # 1. EXECUTIVE SUMMARY
-    # ==============================================================
+<style>
 
-    parts.append("1. EXECUTIVE SUMMARY")
-    parts.append("-" * 60)
+body {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
 
-    summary = ai.get(
+    font-size: 14px;
+    line-height: 1.5;
+
+    color: #000000;
+
+    margin: 0;
+    padding: 20px;
+
+    background: #ffffff;
+}}
+
+.container {{
+    max-width: 1000px;
+    margin: 0 auto;
+}}
+
+h1 {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+
+    font-size: 25px;
+
+    margin-top: 34px;
+    margin-bottom: 12px;
+
+    padding-bottom: 7px;
+
+    border-bottom:
+        1px solid #000000;
+}}
+
+h2 {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+
+    font-size: 19px;
+
+    margin-top: 23px;
+    margin-bottom: 8px;
+}}
+
+h3 {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+
+    font-size: 16px;
+
+    margin-top: 16px;
+    margin-bottom: 6px;
+}}
+
+p {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+
+    margin-top: 0;
+    margin-bottom: 12px;
+}}
+
+ul {{
+    margin-top: 5px;
+    margin-bottom: 16px;
+
+    padding-left: 28px;
+}}
+
+li {{
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+
+    margin-bottom: 5px;
+}}
+
+.date {{
+    font-size: 15px;
+    margin-bottom: 27px;
+}}
+
+.data-table {{
+    width: 100%;
+
+    border-collapse:
+        collapse;
+
+    margin-top: 8px;
+    margin-bottom: 23px;
+
+    table-layout: auto;
+}}
+
+.data-table th {{
+    text-align: left;
+
+    font-weight: bold;
+
+    border-bottom:
+        2px solid #000000;
+
+    padding:
+        7px 10px;
+
+    white-space: nowrap;
+
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+}}
+
+.data-table td {{
+    padding:
+        6px 10px;
+
+    border-bottom:
+        1px solid #dddddd;
+
+    vertical-align: top;
+
+    font-family:
+        "Times New Roman",
+        Times,
+        serif;
+}}
+
+.data-table .ticker {{
+    white-space: nowrap;
+    font-weight: bold;
+}}
+
+.data-table .name {{
+    min-width: 260px;
+
+    white-space: normal;
+
+    overflow-wrap: break-word;
+}}
+
+.data-table .number {{
+    text-align: right;
+
+    white-space: nowrap;
+
+    font-variant-numeric:
+        tabular-nums;
+}}
+
+.positive {{
+    color: #008000;
+}}
+
+.negative {{
+    color: #b00000;
+}}
+
+.neutral {{
+    color: #000000;
+}}
+
+.ticker-review {{
+    margin-bottom: 26px;
+}}
+
+.source {{
+    font-size: 12px;
+
+    margin-top: -4px;
+    margin-bottom: 8px;
+}}
+
+.source a {{
+    color: #000000;
+
+    text-decoration:
+        underline;
+}}
+
+.footer {{
+    margin-top: 38px;
+
+    padding-top: 10px;
+
+    border-top:
+        1px solid #999999;
+
+    font-size: 12px;
+
+    color: #555555;
+}}
+
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<h1>Daily Investment Review</h1>
+
+<p class="date">
+{html_escape(now)}
+</p>
+
+
+<!-- ========================================================= -->
+<!-- 1. EXECUTIVE SUMMARY -->
+<!-- ========================================================= -->
+
+<h1>1. Executive Summary</h1>
+
+{build_bullet_list(
+    ai.get(
         "executive_summary",
         []
     )
+)}
 
-    if summary:
-        add_bullets(
-            parts,
-            summary
-        )
-    else:
-        parts.append("(unavailable)")
 
-    parts.append("")
+<!-- ========================================================= -->
+<!-- 2. MARKET DASHBOARD -->
+<!-- ========================================================= -->
 
-    # ==============================================================
-    # 2. MARKET DASHBOARD
-    # ==============================================================
+<h1>2. Market Dashboard</h1>
 
-    parts.append("2. MARKET DASHBOARD")
-    parts.append("-" * 60)
 
-    # ------------------------------
-    # Indices
-    # ------------------------------
-    parts.append("MAJOR INDICES")
-    parts.append("-" * 60)
+<h2>Major Indices</h2>
 
-    for r in indices:
-        parts.append(
-            _fmt_quote_row(r)
-        )
+{build_quote_table(
+    indices,
+    include_price=False
+)}
 
-    parts.append("")
 
-    # ------------------------------
-    # Sectors
-    # ------------------------------
-    parts.append("SECTOR PERFORMANCE")
-    parts.append("-" * 60)
+<h2>Sector Performance</h2>
 
-    sector_rows = sorted(
+{build_labeled_table(
+    sorted(
         sectors,
         key=lambda x: x["daily"],
         reverse=True,
     )
+)}
 
-    for r in sector_rows:
-        parts.append(
-            _fmt_labeled_row(r)
-        )
 
-    parts.append("")
+<h2>Factor / Style Performance</h2>
 
-    # ------------------------------
-    # Factors
-    # ------------------------------
-    parts.append("FACTOR / STYLE PERFORMANCE")
-    parts.append("-" * 60)
-
-    factor_rows = sorted(
+{build_labeled_table(
+    sorted(
         factors,
         key=lambda x: x["daily"],
         reverse=True,
     )
+)}
 
-    for r in factor_rows:
-        parts.append(
-            _fmt_labeled_row(r)
-        )
 
-    parts.append("")
+<h2>Tracked Tickers</h2>
 
-    # ------------------------------
-    # Tracked tickers
-    # ------------------------------
-    parts.append("TRACKED TICKERS")
-    parts.append("-" * 60)
+{build_quote_table(
+    tickers,
+    include_price=False,
+)}
 
-    for r in tickers:
-        parts.append(
-            _fmt_quote_row(r)
-        )
 
-    parts.append("")
+<h2>Portfolio Movements</h2>
+"""
 
-    # ------------------------------
-    # Portfolio movements
-    # ------------------------------
-    parts.append("PORTFOLIO MOVEMENTS")
-    parts.append("-" * 60)
+    # --------------------------------------------------------------
+    # Portfolio weighted return
+    # --------------------------------------------------------------
 
     portfolio_daily = (
         calculate_weighted_portfolio_return(
             portfolio,
-            "daily"
+            "daily",
         )
     )
 
     portfolio_ytd = (
         calculate_weighted_portfolio_return(
             portfolio,
-            "ytd"
+            "ytd",
         )
     )
 
     if (
         portfolio_daily is not None
-        and portfolio_ytd is not None
+        and
+        portfolio_ytd is not None
     ):
-        parts.append(
-            f"Weighted portfolio: "
-            f"{portfolio_daily:+.2f}% today | "
-            f"YTD {portfolio_ytd:+.2f}%"
-        )
-        parts.append("")
 
-    for r in portfolio:
-        parts.append(
-            _fmt_quote_row(r)
-        )
+        html += f"""
+<p>
+<strong>Weighted Portfolio:</strong>
+<span class="{pct_class(portfolio_daily)}">
+{format_pct(portfolio_daily)}
+</span>
+today
+&nbsp;&nbsp;|&nbsp;&nbsp;
+YTD
+<span class="{pct_class(portfolio_ytd)}">
+{format_pct(portfolio_ytd)}
+</span>
+</p>
+"""
 
-    parts.append("")
+    html += f"""
 
-    # ==============================================================
-    # 3. RATES, MACRO & CROSS-ASSET
-    # ==============================================================
+{build_quote_table(
+    portfolio,
+    include_price=False,
+)}
 
-    parts.append("3. RATES, MACRO & CROSS-ASSET")
-    parts.append("-" * 60)
 
-    macro_lines = _fmt_macro_data(
-        macro
-    )
+<!-- ========================================================= -->
+<!-- 3. RATES, MACRO & CROSS-ASSET -->
+<!-- ========================================================= -->
 
-    if macro_lines:
-        parts.extend(macro_lines)
-    else:
-        parts.append("(unavailable)")
-        parts.append("")
+<h1>3. Rates, Macro &amp; Cross-Asset</h1>
 
-    # ==============================================================
-    # 4. TICKER REVIEW
-    # ==============================================================
+{build_macro_table(
+    macro
+)}
 
-    parts.append("4. TICKER REVIEW")
-    parts.append("-" * 60)
 
-    ticker_ai = ai.get(
-        "tickers",
-        {}
-    )
+<!-- ========================================================= -->
+<!-- 4. TICKER REVIEW -->
+<!-- ========================================================= -->
 
-    for r in tickers:
-        parts.append(
-            _fmt_ticker_block(
-                r,
-                ticker_ai.get(
-                    r["ticker"],
-                    {}
-                ),
-            )
-        )
-        parts.append("")
+<h1>4. Ticker Review</h1>
 
-    # ==============================================================
-    # 5. TOP MARKET STORIES
-    # ==============================================================
+{build_ticker_review(
+    tickers,
+    ai
+)}
 
-    parts.append("5. TOP MARKET STORIES")
-    parts.append("-" * 60)
 
-    stories = ai.get(
-        "stories",
-        []
-    )
+<!-- ========================================================= -->
+<!-- 5. TOP MARKET STORIES -->
+<!-- ========================================================= -->
 
-    if not stories:
-        parts.append("(unavailable)")
-        parts.append("")
+<h1>5. Top Market Stories</h1>
 
-    for story in stories:
+{build_market_stories(
+    market_news,
+    ai
+)}
 
-        title = story.get(
-            "title",
-            ""
-        ).strip()
 
-        summary = story.get(
-            "summary",
-            ""
-        ).strip()
+<!-- ========================================================= -->
+<!-- 6. INVESTMENT IMPLICATIONS -->
+<!-- ========================================================= -->
 
-        source_index = story.get(
-            "source_index"
-        )
+<h1>6. Investment Implications</h1>
 
-        if title:
-            parts.append(
-                title.upper()
-            )
-            parts.append("")
 
-        if summary:
-            parts.extend(
-                wrap_text(
-                    summary,
-                    width=78
-                )
-            )
-            parts.append("")
+<h2>Bull Case</h2>
 
-        if (
-            isinstance(source_index, int)
-            and 1 <= source_index
-            <= len(market_news)
-        ):
-            source = market_news[
-                source_index - 1
-            ]
-
-            publisher = source.get(
-                "publisher",
-                "Unknown"
-            )
-
-            url = source.get(
-                "url",
-                ""
-            )
-
-            if url:
-                parts.append(
-                    f"Source: {publisher} — {url}"
-                )
-            else:
-                parts.append(
-                    f"Source: {publisher}"
-                )
-
-        parts.append("")
-        parts.append("-" * 60)
-        parts.append("")
-
-    # ==============================================================
-    # 6. INVESTMENT IMPLICATIONS
-    # ==============================================================
-
-    parts.append("6. INVESTMENT IMPLICATIONS")
-    parts.append("-" * 60)
-
-    implications = ai.get(
+{build_bullet_list(
+    ai.get(
         "investment_implications",
         {}
-    )
-
-    parts.append("BULL CASE")
-    parts.append("-" * 30)
-
-    bull_case = implications.get(
+    ).get(
         "bull_case",
         []
     )
+)}
 
-    if bull_case:
-        add_bullets(
-            parts,
-            bull_case
-        )
-    else:
-        parts.append("(unavailable)")
 
-    parts.append("")
-    parts.append("BEAR CASE")
-    parts.append("-" * 30)
+<h2>Bear Case</h2>
 
-    bear_case = implications.get(
+{build_bullet_list(
+    ai.get(
+        "investment_implications",
+        {}
+    ).get(
         "bear_case",
         []
     )
+)}
 
-    if bear_case:
-        add_bullets(
-            parts,
-            bear_case
-        )
-    else:
-        parts.append("(unavailable)")
 
-    parts.append("")
+<h2>Key Question</h2>
 
-    parts.append("KEY QUESTION")
-    parts.append("-" * 30)
-
-    key_question = implications.get(
+{build_paragraph(
+    ai.get(
+        "investment_implications",
+        {}
+    ).get(
         "key_question",
         ""
-    ).strip()
+    )
+)}
 
-    if key_question:
-        parts.extend(
-            wrap_text(
-                key_question
-            )
-        )
-    else:
-        parts.append("(unavailable)")
 
-    parts.append("")
+<!-- ========================================================= -->
+<!-- 7. LOOKING AHEAD -->
+<!-- ========================================================= -->
 
-    # ==============================================================
-    # 7. LOOKING AHEAD
-    # ==============================================================
+<h1>7. Looking Ahead</h1>
 
-    parts.append("7. LOOKING AHEAD")
-    parts.append("-" * 60)
 
-    if lookahead["earnings"]:
-        parts.append("UPCOMING EARNINGS")
-        parts.append("-" * 30)
+<h2>Upcoming Earnings</h2>
+"""
 
-        for e in sorted(
+    if lookahead[
+        "earnings"
+    ]:
+
+        html += "<ul>"
+
+        for earnings in sorted(
             lookahead["earnings"],
-            key=lambda x: x["date"]
+            key=lambda x: x["date"],
         ):
-            parts.append(
-                f"{e['date']}: "
-                f"{e['ticker']} "
-                f"({e['name']})"
+
+            html += (
+                "<li>"
+                f"<strong>"
+                f"{html_escape(earnings['date'])}"
+                f"</strong>: "
+                f"{html_escape(earnings['ticker'])} "
+                f"("
+                f"{html_escape(earnings['name'])}"
+                f")"
+                "</li>"
             )
 
-        parts.append("")
+        html += "</ul>"
 
-    if lookahead["macro"]:
-        parts.append(
-            "MACRO DEVELOPMENTS TO MONITOR"
+    else:
+
+        html += (
+            "<p>"
+            "No upcoming tracked-company "
+            "earnings found."
+            "</p>"
         )
-        parts.append("-" * 30)
 
-        for h in lookahead["macro"]:
-            parts.append(
-                f"• {h['title']} — "
-                f"{h['publisher']}"
+    if lookahead[
+        "macro"
+    ]:
+
+        html += (
+            "<h2>"
+            "Macro Developments to Monitor"
+            "</h2>"
+        )
+
+        html += "<ul>"
+
+        for headline in (
+            lookahead["macro"]
+        ):
+
+            html += (
+                "<li>"
+                f"{html_escape(headline['title'])}"
+                " — "
+                f"{html_escape(headline['publisher'])}"
+                "</li>"
             )
 
-        parts.append("")
+        html += "</ul>"
 
-    looking_ahead_text = ai.get(
+    html += f"""
+
+<h2>Forward View</h2>
+
+{build_paragraph(
+    ai.get(
         "looking_ahead",
         ""
-    ).strip()
+    )
+)}
 
-    if looking_ahead_text:
-        parts.extend(
-            wrap_text(
-                looking_ahead_text,
-                width=78
-            )
-        )
-    else:
-        parts.append("(unavailable)")
 
-    parts.append("")
+<!-- ========================================================= -->
+<!-- 8. BOTTOM LINE -->
+<!-- ========================================================= -->
 
-    # ==============================================================
-    # 8. BOTTOM LINE
-    # ==============================================================
+<h1>8. Bottom Line</h1>
 
-    parts.append("8. BOTTOM LINE")
-    parts.append("-" * 60)
-
-    bottom_line = ai.get(
+{build_paragraph(
+    ai.get(
         "bottom_line",
         ""
-    ).strip()
-
-    if bottom_line:
-        parts.extend(
-            wrap_text(
-                bottom_line,
-                width=78
-            )
-        )
-    else:
-        parts.append("(unavailable)")
-
-    parts.append("")
-    parts.append("-" * 60)
-    parts.append(
-        "Generated automatically via Yahoo Finance, FRED & Groq"
     )
+)}
 
-    return "\n".join(parts)
+
+<div class="footer">
+Generated automatically via
+Yahoo Finance, FRED &amp; Groq
+</div>
+
+</div>
+</body>
+</html>
+"""
+
+    return html
 
 
 # ==================================================================
 # EMAIL
 # ==================================================================
 
-def send_email(subject, body):
+def send_email(
+    subject,
+    html_body,
+    plain_text_body=None,
+):
     """
-    Send the report as HTML using a monospace font so all
-    fixed-width columns remain aligned.
-    """
-
-    html_body = f"""
-    <html>
-        <body>
-            <pre style="
-                font-family: Menlo, Monaco, Consolas, 'Courier New', monospace;
-                font-size: 13px;
-                line-height: 1.45;
-                white-space: pre-wrap;
-            ">{escape(body)}</pre>
-        </body>
-    </html>
+    Send multipart email with:
+        - plain-text fallback
+        - HTML formatted report
     """
 
-    msg = MIMEText(html_body, "html")
+    msg = MIMEMultipart(
+        "alternative"
+    )
+
     msg["Subject"] = subject
-    msg["From"] = config.EMAIL_SENDER
-    msg["To"] = ", ".join(config.EMAIL_RECIPIENT)
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    msg["From"] = (
+        config.EMAIL_SENDER
+    )
+
+    msg["To"] = ", ".join(
+        config.EMAIL_RECIPIENT
+    )
+
+    if not plain_text_body:
+
+        plain_text_body = (
+            "Please view this email "
+            "in an HTML-capable "
+            "email client."
+        )
+
+    msg.attach(
+        MIMEText(
+            plain_text_body,
+            "plain",
+            "utf-8",
+        )
+    )
+
+    msg.attach(
+        MIMEText(
+            html_body,
+            "html",
+            "utf-8",
+        )
+    )
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+    ) as server:
+
         server.login(
             config.EMAIL_SENDER,
-            config.EMAIL_PASSWORD
+            config.EMAIL_PASSWORD,
         )
+
         server.sendmail(
             config.EMAIL_SENDER,
             config.EMAIL_RECIPIENT,
-            msg.as_string()
+            msg.as_string(),
         )
 
 
@@ -1911,79 +3198,127 @@ def send_email(subject, body):
 def main():
 
     # --------------------------------------------------------------
-    # Run guard
+    # Fresh-data check
     # --------------------------------------------------------------
 
-    if not has_fresh_data("^GSPC"):
+    if not has_fresh_data(
+        "^GSPC"
+    ):
+
         print(
-            "No fresh market data for today — exiting."
+            "No fresh market data "
+            "for today — exiting."
         )
+
         return
 
+    # --------------------------------------------------------------
+    # Duplicate-run check
+    # --------------------------------------------------------------
+
     if already_ran_today():
+
         print(
             "Already ran today — exiting."
         )
+
         return
 
     # --------------------------------------------------------------
     # Gather data
     # --------------------------------------------------------------
 
-    print("Gathering indices...")
+    print(
+        "Gathering indices..."
+    )
+
     indices = gather_group(
         config.INDICES,
-        with_headlines=False
+        with_headlines=False,
     )
 
-    print("Gathering tracked tickers...")
+    print(
+        "Gathering tracked tickers..."
+    )
+
     tickers = gather_group(
         config.TICKERS,
-        with_headlines=True
+        with_headlines=True,
     )
 
-    print("Gathering portfolio...")
+    print(
+        "Gathering portfolio..."
+    )
+
     portfolio = gather_group(
         config.PORTFOLIO,
-        with_headlines=False
+        with_headlines=False,
     )
 
-    print("Gathering sectors...")
+    print(
+        "Gathering sectors..."
+    )
+
     sectors = gather_labeled_etfs(
         SECTOR_ETFS
     )
 
-    print("Gathering factors...")
+    print(
+        "Gathering factors..."
+    )
+
     factors = gather_labeled_etfs(
         FACTOR_ETFS
     )
 
-    print("Gathering macro data...")
-    macro = gather_macro_data()
-
-    print("Gathering market headlines...")
-    market_news = gather_market_news(
-        limit=10
+    print(
+        "Gathering macro data..."
     )
 
-    print("Gathering lookahead...")
-    lookahead = gather_lookahead()
+    macro = gather_macro_data()
 
-    # --------------------------------------------------------------
-    # Basic data check
-    # --------------------------------------------------------------
+    print(
+        "Gathering market headlines..."
+    )
 
-    if not indices and not tickers and not portfolio:
-        print(
-            "No data gathered — exiting without email."
+    market_news = (
+        gather_market_news(
+            limit=10
         )
+    )
+
+    print(
+        "Gathering lookahead..."
+    )
+
+    lookahead = (
+        gather_lookahead()
+    )
+
+    # --------------------------------------------------------------
+    # Basic data validation
+    # --------------------------------------------------------------
+
+    if (
+        not indices
+        and not tickers
+        and not portfolio
+    ):
+
+        print(
+            "No data gathered — "
+            "exiting without email."
+        )
+
         return
 
     # --------------------------------------------------------------
     # AI analysis
     # --------------------------------------------------------------
 
-    print("Building AI analysis...")
+    print(
+        "Building AI analysis..."
+    )
 
     ai = build_ai_summary(
         indices=indices,
@@ -1997,19 +3332,22 @@ def main():
     )
 
     # --------------------------------------------------------------
-    # Compose and send
+    # Email
     # --------------------------------------------------------------
 
-    today_str = market_today().strftime(
-        "%a, %b %d %Y"
+    today_str = (
+        market_today()
+        .strftime(
+            "%a, %b %d %Y"
+        )
     )
 
     subject = (
-        f"Daily Investment Review — "
+        "Daily Investment Review — "
         f"{today_str}"
     )
 
-    body = compose_email(
+    html_body = compose_email(
         indices=indices,
         sectors=sectors,
         factors=factors,
@@ -2022,13 +3360,18 @@ def main():
     )
 
     send_email(
-        subject,
-        body
+        subject=subject,
+        html_body=html_body,
     )
 
     print(
-        "Daily investment review email sent."
+        "Daily investment review "
+        "email sent."
     )
+
+    # --------------------------------------------------------------
+    # Mark successful run
+    # --------------------------------------------------------------
 
     mark_run_success()
 
