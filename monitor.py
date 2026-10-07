@@ -1310,13 +1310,14 @@ def wrap_text(text, width=78):
 def _fmt_quote_row(r):
     arrow = "▲" if r["daily"] >= 0 else "▼"
 
+    ticker = r["ticker"][:8]
     name = r["name"][:24]
 
     return (
-        f"{r['ticker']:<8} "
+        f"{ticker:<8} "
         f"{name:<24} "
-        f"{r['daily']:>+7.2f}% {arrow}   "
-        f"YTD {r['ytd']:>+7.2f}%"
+        f"{r['daily']:>8.2f}% {arrow}   "
+        f"YTD {r['ytd']:>8.2f}%"
     )
 
 
