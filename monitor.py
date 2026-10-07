@@ -17,11 +17,8 @@ from html import escape
 import config
 
 
-# ==================================================================
-# CONFIG / ENVIRONMENT
-# ==================================================================
+# Configuration and environment overrides
 
-# Override config with GitHub secrets if running in Actions
 config.EMAIL_SENDER = os.environ.get(
     "EMAIL_SENDER", config.EMAIL_SENDER
 )
@@ -51,14 +48,7 @@ config.GIST_TOKEN = os.environ.get(
 MARKET_TZ = pytz.timezone("America/New_York")
 
 
-# Default sector ETF proxies.
-# These can be overridden in config.py with:
-#
-# SECTOR_ETFS = {
-#     "Information Technology": "XLK",
-#     ...
-# }
-#
+# Default sector ETF proxies; can be overridden in config.py.
 DEFAULT_SECTOR_ETFS = {
     "Information Technology": "XLK",
     "Communication Services": "XLC",
@@ -74,15 +64,7 @@ DEFAULT_SECTOR_ETFS = {
 }
 
 
-# Default factor/style ETF proxies.
-#
-# These can be overridden in config.py with:
-#
-# FACTOR_ETFS = {
-#     "Growth": "VUG",
-#     ...
-# }
-#
+# Default factor/style ETF proxies; can be overridden in config.py.
 DEFAULT_FACTOR_ETFS = {
     "Growth": "VUG",
     "Momentum": "MTUM",
@@ -106,15 +88,7 @@ FACTOR_ETFS = getattr(
 )
 
 
-# Optional custom company/security names.
-#
-# Example:
-#
-# TICKER_NAMES = {
-#     "AAPL": "Apple Inc.",
-#     "CAUS.TO": "CI U.S. Equity Index ETF",
-# }
-#
+# Optional custom security names.
 TICKER_NAMES = getattr(
     config,
     "TICKER_NAMES",
@@ -122,21 +96,7 @@ TICKER_NAMES = getattr(
 )
 
 
-# Optional portfolio weights.
-#
-# Example:
-#
-# PORTFOLIO_WEIGHTS = {
-#     "AAPL": 0.20,
-#     "MSFT": 0.20,
-#     "NVDA": 0.15,
-#     "AMZN": 0.15,
-#     "JPM": 0.15,
-#     "XOM": 0.15,
-# }
-#
-# If no weights are supplied, the report still shows the
-# daily/YTD movements of each portfolio holding.
+# Optional portfolio weights for weighted returns.
 PORTFOLIO_WEIGHTS = getattr(
     config,
     "PORTFOLIO_WEIGHTS",
@@ -144,14 +104,10 @@ PORTFOLIO_WEIGHTS = getattr(
 )
 
 
-# ==================================================================
-# DATE HELPERS
-# ==================================================================
+# Date helpers
 
 def market_today():
-    """
-    Return the current calendar date in New York time.
-    """
+    """Return the current calendar date in New York time."""
     return datetime.now(MARKET_TZ).date()
 
 
@@ -159,14 +115,10 @@ def next_day(d):
     return d + timedelta(days=1)
 
 
-# ==================================================================
-# FRESH-DATA / RUN-GUARD HELPERS
-# ==================================================================
+# Fresh-data and duplicate-run checks
 
 def has_fresh_data(ticker):
-    """
-    Check whether Yahoo Finance has a daily observation dated today.
-    """
+    """Check whether Yahoo Finance has a daily observation for today."""
 
     try:
         hist = yf.Ticker(ticker).history(
@@ -281,19 +233,12 @@ def mark_run_success():
         )
 
 
-# ==================================================================
-# QUOTE HELPERS
-# ==================================================================
+# Quote and performance helpers
 
 def get_quote_and_ytd(ticker):
     """
-    Return:
-        current close,
-        daily percentage change,
-        YTD percentage change.
-
-    Uses historical daily closes rather than fast_info so that
-    after-hours movements do not distort the daily return.
+    Return current close, daily percentage change, and YTD percentage change.
+    Uses historical closes so after-hours movement does not distort returns.
     """
 
     try:
@@ -368,13 +313,7 @@ def get_quote_and_ytd(ticker):
 
 @lru_cache(maxsize=None)
 def company_name(ticker):
-    """
-    Return a display name without calling Yahoo's
-    fundamentals endpoint.
-
-    This avoids quoteSummary 404 errors for certain
-    Canadian securities and other symbols.
-    """
+    """Return a display name without using Yahoo's fundamentals endpoint."""
 
     if ticker in TICKER_NAMES:
         return TICKER_NAMES[ticker]
@@ -382,21 +321,10 @@ def company_name(ticker):
     return ticker
 
 
-# ==================================================================
-# NEWS HELPERS
-# ==================================================================
+# News helpers
 
 def get_headlines(ticker, limit=5):
-    """
-    Return:
-        [
-            {
-                "title": "...",
-                "publisher": "...",
-                "url": "..."
-            }
-        ]
-    """
+    """Return deduplicated Yahoo Finance headlines for a ticker."""
 
     try:
         news = (
@@ -480,12 +408,7 @@ def get_headlines(ticker, limit=5):
 
 
 def gather_market_news(limit=10):
-    """
-    Gather broad market headlines from indices,
-    rates, commodities, volatility and major ETFs.
-
-    Deduplicates identical headlines.
-    """
+    """Gather and deduplicate broad market headlines."""
 
     seen = set()
     out = []
@@ -532,9 +455,7 @@ def gather_market_news(limit=10):
     return out
 
 
-# ==================================================================
-# DATA GATHERING
-# ==================================================================
+# Market and ETF data gathering
 
 def gather_group(
     tickers,
@@ -581,9 +502,7 @@ def gather_group(
 
 
 def gather_labeled_etfs(mapping):
-    """
-    Gather performance for sector/factor ETF proxies.
-    """
+    """Gather performance for sector and factor ETF proxies."""
 
     rows = []
 
@@ -615,20 +534,13 @@ def gather_labeled_etfs(mapping):
     return rows
 
 
-# ==================================================================
-# PORTFOLIO
-# ==================================================================
+# Portfolio calculations
 
 def calculate_weighted_portfolio_return(
     rows,
     field,
 ):
-    """
-    Calculate a weighted portfolio return.
-
-    Returns None if portfolio weights have not been
-    supplied or no valid weights match the holdings.
-    """
+    """Calculate a weighted portfolio return when weights are available."""
 
     if not PORTFOLIO_WEIGHTS:
         return None
@@ -667,17 +579,10 @@ def calculate_weighted_portfolio_return(
     )
 
 
-# ==================================================================
-# FRED MACRO DATA
-# ==================================================================
+# FRED macro data
 
 def get_fred_series(series_id):
-    """
-    Pull the two latest observations from FRED's
-    public CSV endpoint.
-
-    No FRED API key is required.
-    """
+    """Pull the two latest valid observations from FRED's public CSV endpoint."""
 
     url = (
         "https://fred.stlouisfed.org/graph/"
@@ -745,25 +650,14 @@ def get_fred_series(series_id):
 
 
 def gather_macro_data():
-    """
-    Gather:
-        - 2Y Treasury
-        - 10Y Treasury
-        - 30Y Treasury
-        - DXY
-        - Gold
-        - WTI Crude
-        - VIX
-    """
+    """Gather Treasury rates and major cross-asset markets."""
 
     data = {
         "rates": [],
         "cross_asset": [],
     }
 
-    # --------------------------------------------------------------
     # Treasury rates
-    # --------------------------------------------------------------
 
     treasury_series = {
         "2Y Treasury": "DGS2",
@@ -798,9 +692,7 @@ def gather_macro_data():
             }
         )
 
-    # --------------------------------------------------------------
     # Cross-asset markets
-    # --------------------------------------------------------------
 
     cross_asset_map = {
         "DXY": "DX-Y.NYB",
@@ -835,9 +727,7 @@ def gather_macro_data():
     return data
 
 
-# ==================================================================
-# LOOKING AHEAD
-# ==================================================================
+# Looking ahead: earnings and macro headlines
 
 def normalize_date_value(value):
     if value is None:
@@ -883,9 +773,7 @@ def normalize_date_value(value):
 
 
 def extract_earnings_dates(calendar):
-    """
-    Handle common yfinance earnings calendar formats.
-    """
+    """Handle common yfinance earnings calendar formats."""
 
     results = []
 
@@ -893,6 +781,7 @@ def extract_earnings_dates(calendar):
         return results
 
     # Dictionary format
+
     if isinstance(
         calendar,
         dict,
@@ -927,6 +816,7 @@ def extract_earnings_dates(calendar):
         return results
 
     # DataFrame-like format
+
     try:
 
         if (
@@ -967,11 +857,7 @@ def extract_earnings_dates(calendar):
 
 
 def gather_lookahead():
-    """
-    Gather:
-        - upcoming earnings for tracked securities
-        - macro-related headlines for context
-    """
+    """Gather upcoming earnings and macro-related headlines."""
 
     lookahead = {
         "earnings": [],
@@ -985,9 +871,7 @@ def gather_lookahead():
         + timedelta(days=7)
     )
 
-    # --------------------------------------------------------------
     # Earnings
-    # --------------------------------------------------------------
 
     tracked_for_earnings = list(
         dict.fromkeys(
@@ -1045,9 +929,7 @@ def gather_lookahead():
                 f"for {ticker}: {e}"
             )
 
-    # --------------------------------------------------------------
     # Macro headlines
-    # --------------------------------------------------------------
 
     macro_keywords = [
         "fed",
@@ -1120,19 +1002,14 @@ def gather_lookahead():
     return lookahead
 
 
-# ==================================================================
-# GROQ
-# ==================================================================
+# Groq API
 
 def _groq_call(
     prompt,
     max_tokens=6500,
     temperature=0.3,
 ):
-    """
-    Make a single Groq API call and return
-    the parsed JSON response.
-    """
+    """Make a Groq API call and return the parsed JSON response."""
 
     groq_url = (
         "https://api.groq.com/openai/v1/"
@@ -1222,9 +1099,7 @@ def _groq_call(
         .strip()
     )
 
-    # --------------------------------------------------------------
-    # Remove markdown code fences
-    # --------------------------------------------------------------
+    # Remove markdown code fences if present.
 
     if raw.startswith("```"):
 
@@ -1252,9 +1127,7 @@ def _groq_call(
             lines
         ).strip()
 
-    # --------------------------------------------------------------
-    # Extract JSON object
-    # --------------------------------------------------------------
+    # Extract the JSON object from the response.
 
     first_brace = raw.find(
         "{"
@@ -1295,9 +1168,7 @@ def _groq_call(
         return None
 
 
-# ==================================================================
-# AI ANALYSIS
-# ==================================================================
+# AI analysis
 
 def build_ai_summary(
     indices,
@@ -1310,9 +1181,7 @@ def build_ai_summary(
     lookahead,
 ):
 
-    # --------------------------------------------------------------
-    # Formatting helpers for prompt
-    # --------------------------------------------------------------
+    # Prompt formatting helpers
 
     def fmt_indices(rows):
 
@@ -1552,9 +1421,7 @@ def build_ai_summary(
             "movements only."
         )
 
-    # --------------------------------------------------------------
-    # Prompt
-    # --------------------------------------------------------------
+    # Groq prompt
 
     prompt = f"""
 You are writing a professional daily investment review for someone
@@ -1734,9 +1601,7 @@ BOTTOM LINE
             "bottom_line": "",
         }
 
-    # --------------------------------------------------------------
-    # Executive summary
-    # --------------------------------------------------------------
+    # Normalize executive summary
 
     executive_summary = (
         parsed.get(
@@ -1757,9 +1622,7 @@ BOTTOM LINE
         if str(item).strip()
     ][:5]
 
-    # --------------------------------------------------------------
-    # Ticker summaries
-    # --------------------------------------------------------------
+    # Normalize ticker summaries
 
     ticker_notes_raw = (
         parsed.get("tickers")
@@ -1831,9 +1694,7 @@ BOTTOM LINE
                 "cites": cites,
             }
 
-    # --------------------------------------------------------------
-    # Market stories
-    # --------------------------------------------------------------
+    # Normalize market stories
 
     stories_raw = (
         parsed.get("stories")
@@ -1878,9 +1739,7 @@ BOTTOM LINE
                 }
             )
 
-    # --------------------------------------------------------------
-    # Investment implications
-    # --------------------------------------------------------------
+    # Normalize investment implications
 
     implications_raw = (
         parsed.get(
@@ -1942,9 +1801,7 @@ BOTTOM LINE
         ).strip(),
     }
 
-    # --------------------------------------------------------------
-    # Looking ahead
-    # --------------------------------------------------------------
+    # Normalize forward view
 
     looking_ahead = str(
         parsed.get(
@@ -1953,9 +1810,7 @@ BOTTOM LINE
         or ""
     ).strip()
 
-    # --------------------------------------------------------------
-    # Bottom line
-    # --------------------------------------------------------------
+    # Normalize bottom line
 
     bottom_line = str(
         parsed.get(
@@ -1985,9 +1840,7 @@ BOTTOM LINE
     }
 
 
-# ==================================================================
-# HTML HELPERS
-# ==================================================================
+# HTML helpers
 
 def html_escape(value):
     return escape(
@@ -2014,12 +1867,7 @@ def build_quote_table(
     rows,
     include_price=False,
 ):
-    """
-    Build HTML table for indices,
-    tickers and portfolio holdings.
-
-    Names are never truncated.
-    """
+    """Build HTML tables for indices, tickers, and portfolio holdings."""
 
     if not rows:
         return (
@@ -2109,9 +1957,7 @@ def build_quote_table(
 
 
 def build_labeled_table(rows):
-    """
-    Build HTML table for sectors/factors.
-    """
+    """Build HTML tables for sectors and factors."""
 
     if not rows:
         return (
@@ -2169,9 +2015,7 @@ def build_labeled_table(rows):
 def build_macro_table(macro):
     html = ""
 
-    # --------------------------------------------------------------
     # Treasury rates
-    # --------------------------------------------------------------
 
     if macro.get(
         "rates"
@@ -2221,9 +2065,7 @@ def build_macro_table(macro):
             "</table>"
         )
 
-    # --------------------------------------------------------------
-    # Cross asset
-    # --------------------------------------------------------------
+    # Cross-asset markets
 
     if macro.get(
         "cross_asset"
@@ -2346,11 +2188,7 @@ def build_ticker_review(
     tickers,
     ai,
 ):
-    """
-    Detailed company-by-company review.
-
-    Full names are preserved.
-    """
+    """Build the detailed company-by-company review."""
 
     ticker_ai = ai.get(
         "tickers",
@@ -2514,8 +2352,8 @@ def build_market_stories(
 
         if summary:
 
-            # Preserve paragraphs if the model
-            # returns blank lines.
+            # Preserve paragraph breaks from the model.
+
             paragraphs = [
                 p.strip()
                 for p in summary.split(
@@ -2575,9 +2413,7 @@ def build_paragraph(
     )
 
 
-# ==================================================================
-# EMAIL COMPOSITION
-# ==================================================================
+# Email composition
 
 def compose_email(
     indices,
@@ -2822,9 +2658,7 @@ li {{
 </p>
 
 
-<!-- ========================================================= -->
-<!-- 1. EXECUTIVE SUMMARY -->
-<!-- ========================================================= -->
+<!-- 1. Executive Summary -->
 
 <h1>1. Executive Summary</h1>
 
@@ -2836,9 +2670,7 @@ li {{
 )}
 
 
-<!-- ========================================================= -->
-<!-- 2. MARKET DASHBOARD -->
-<!-- ========================================================= -->
+<!-- 2. Market Dashboard -->
 
 <h1>2. Market Dashboard</h1>
 
@@ -2884,9 +2716,7 @@ li {{
 <h2>Portfolio Movements</h2>
 """
 
-    # --------------------------------------------------------------
-    # Portfolio weighted return
-    # --------------------------------------------------------------
+    # Add weighted portfolio performance when available.
 
     portfolio_daily = (
         calculate_weighted_portfolio_return(
@@ -2931,9 +2761,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 3. RATES, MACRO & CROSS-ASSET -->
-<!-- ========================================================= -->
+<!-- 3. Rates, Macro & Cross-Asset -->
 
 <h1>3. Rates, Macro &amp; Cross-Asset</h1>
 
@@ -2942,9 +2770,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 4. TICKER REVIEW -->
-<!-- ========================================================= -->
+<!-- 4. Ticker Review -->
 
 <h1>4. Ticker Review</h1>
 
@@ -2954,9 +2780,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 5. TOP MARKET STORIES -->
-<!-- ========================================================= -->
+<!-- 5. Top Market Stories -->
 
 <h1>5. Top Market Stories</h1>
 
@@ -2966,9 +2790,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 6. INVESTMENT IMPLICATIONS -->
-<!-- ========================================================= -->
+<!-- 6. Investment Implications -->
 
 <h1>6. Investment Implications</h1>
 
@@ -3012,9 +2834,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 7. LOOKING AHEAD -->
-<!-- ========================================================= -->
+<!-- 7. Looking Ahead -->
 
 <h1>7. Looking Ahead</h1>
 
@@ -3094,9 +2914,7 @@ YTD
 )}
 
 
-<!-- ========================================================= -->
-<!-- 8. BOTTOM LINE -->
-<!-- ========================================================= -->
+<!-- 8. Bottom Line -->
 
 <h1>8. Bottom Line</h1>
 
@@ -3121,20 +2939,14 @@ Yahoo Finance, FRED &amp; Groq
     return html
 
 
-# ==================================================================
-# EMAIL
-# ==================================================================
+# Email sending
 
 def send_email(
     subject,
     html_body,
     plain_text_body=None,
 ):
-    """
-    Send multipart email with:
-        - plain-text fallback
-        - HTML formatted report
-    """
+    """Send the report as a multipart HTML/plain-text email."""
 
     msg = MIMEMultipart(
         "alternative"
@@ -3191,15 +3003,11 @@ def send_email(
         )
 
 
-# ==================================================================
-# MAIN
-# ==================================================================
+# Main workflow
 
 def main():
 
-    # --------------------------------------------------------------
-    # Fresh-data check
-    # --------------------------------------------------------------
+    # Confirm fresh market data.
 
     if not has_fresh_data(
         "^GSPC"
@@ -3212,9 +3020,7 @@ def main():
 
         return
 
-    # --------------------------------------------------------------
-    # Duplicate-run check
-    # --------------------------------------------------------------
+    # Prevent duplicate daily runs.
 
     if already_ran_today():
 
@@ -3224,9 +3030,7 @@ def main():
 
         return
 
-    # --------------------------------------------------------------
-    # Gather data
-    # --------------------------------------------------------------
+    # Gather market data.
 
     print(
         "Gathering indices..."
@@ -3295,9 +3099,7 @@ def main():
         gather_lookahead()
     )
 
-    # --------------------------------------------------------------
-    # Basic data validation
-    # --------------------------------------------------------------
+    # Stop if no usable market data was gathered.
 
     if (
         not indices
@@ -3312,9 +3114,7 @@ def main():
 
         return
 
-    # --------------------------------------------------------------
-    # AI analysis
-    # --------------------------------------------------------------
+    # Generate AI analysis.
 
     print(
         "Building AI analysis..."
@@ -3331,9 +3131,7 @@ def main():
         lookahead=lookahead,
     )
 
-    # --------------------------------------------------------------
-    # Email
-    # --------------------------------------------------------------
+    # Build and send the email.
 
     today_str = (
         market_today()
@@ -3369,9 +3167,7 @@ def main():
         "email sent."
     )
 
-    # --------------------------------------------------------------
-    # Mark successful run
-    # --------------------------------------------------------------
+    # Record successful completion.
 
     mark_run_success()
 
