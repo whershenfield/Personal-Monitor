@@ -1460,44 +1460,46 @@ def build_ai_summary(
 
         return "\n".join(lines)
 
-def fmt_news(rows):
+    def fmt_news(rows):
 
-    if not rows:
-        return (
-            "(no market news search results)"
-        )
-
-    lines = []
-
-    for i, h in enumerate(
-        rows,
-        start=1,
-    ):
-
-        lines.append(
-            f"[{i}] {h['title']}"
-        )
-
-        lines.append(
-            f"    Publisher: "
-            f"{h['publisher']}"
-        )
-
-        if h.get("snippet"):
-
-            lines.append(
-                f"    Summary: "
-                f"{h['snippet']}"
+        if not rows:
+            return (
+                "(no market news search results)"
             )
 
-        if h.get("url"):
+        lines = []
+
+        for i, h in enumerate(
+            rows,
+            start=1,
+        ):
 
             lines.append(
-                f"    URL: "
-                f"{h['url']}"
+                f"[{i}] {h['title']}"
             )
 
-    return "\n".join(lines)
+            lines.append(
+                f"    Publisher: "
+                f"{h['publisher']}"
+            )
+
+            if h.get("snippet"):
+
+                lines.append(
+                    f"    Summary: "
+                    f"{h['snippet']}"
+                )
+
+            if h.get("url"):
+
+                lines.append(
+                    f"    URL: "
+                    f"{h['url']}"
+                )
+
+        return "\n".join(lines)
+
+
     def fmt_lookahead(lookahead_data):
 
         lines = []
@@ -1546,7 +1548,6 @@ def fmt_news(rows):
             return "(no lookahead data)"
 
         return "\n".join(lines)
-
     portfolio_daily = (
         calculate_weighted_portfolio_return(
             portfolio,
@@ -3103,7 +3104,7 @@ YTD
 
 <div class="footer">
 Generated automatically via
-Yahoo Finance, FRED &amp; Groq
+Yahoo Finance, Tavily, FRED &amp; Groq
 </div>
 
 </div>
