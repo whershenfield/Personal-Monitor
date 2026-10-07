@@ -326,6 +326,8 @@ def company_name(ticker):
 
 # News helpers
 
+# News helpers
+
 def get_headlines(ticker, limit=5):
     """Return deduplicated Yahoo Finance headlines for a ticker."""
 
@@ -410,72 +412,176 @@ def get_headlines(ticker, limit=5):
     return out
 
 
-def gather_market_news(limit=5):
-    print("Gathering market headlines...")
+def gather_market_news(limit=10):
+    """
+    Search the current web for major financial-market stories.
 
-    news = []
+    The search is deliberately broad rather than ticker-driven.
+    Groq will later select the most important distinct stories.
+    """
 
-    for ticker in ["SPY", "^GSPC", "QQQ", "TLT", "^TNX", "^VIX", "DX-Y.NYB", "GC=F", "CL=F"]:
-        headlines = get_headlines(ticker, limit=limit)
+    print(
+        "Gathering market news from the web..."
+    )
 
-        print(f"  {ticker}: {len(headlines)} headlines")
+    api_key = getattr(
+        config,
+        "TAVILY_API_KEY",
+        "",
+    )
 
-        for item in headlines:
-            news.append({
-                "ticker": ticker,
-                **item
-            })
-
-    print(f"Total market headlines collected: {len(news)}")
-
-    return news
-
-
-# Market and ETF data gathering
-
-def gather_group(
-    tickers,
-    with_headlines=False,
-):
-    rows = []
-
-    for ticker in tickers:
-
-        current, daily, ytd = (
-            get_quote_and_ytd(
-                ticker
-            )
+    if not api_key:
+        print(
+            "TAVILY_API_KEY is not configured."
         )
+        return []
 
-        if current is None:
-            print(
-                f"Could not fetch data "
-                f"for {ticker}"
+    today = market_today()
+
+    queries = [
+        (
+            f"major financial market news "
+            f"stocks bonds economy today "
+            f"{today.isoformat()}"
+        ),
+        (
+            f"Wall Street markets Federal Reserve "
+            f"interest rates inflation today "
+            f"{today.isoformat()}"
+        ),
+        (
+            f"major business financial news "
+            f"investors today "
+            f"{today.isoformat()}"
+        ),
+        (
+            f"oil gold dollar Treasury markets "
+            f"today {today.isoformat()}"
+        ),
+    ]
+
+    results = []
+    seen_urls = set()
+    seen_titles = set()
+
+    for query in queries:
+
+        try:
+
+            response = requests.post(
+                "https://api.tavily.com/search",
+                headers={
+                    "Content-Type":
+                        "application/json",
+                },
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "topic": "news",
+                    "days": 2,
+                    "max_results": limit,
+                    "include_answer": False,
+                },
+                timeout=30,
             )
+
+            if response.status_code != 200:
+
+                print(
+                    "Tavily search failed: "
+                    f"{response.status_code} "
+                    f"{response.text[:500]}"
+                )
+
+                continue
+
+            data = response.json()
+
+        except Exception as e:
+
+            print(
+                f"News search exception: {e}"
+            )
+
             continue
 
-        rows.append(
-            {
-                "ticker": ticker,
-                "name": company_name(
-                    ticker
-                ),
-                "price": current,
-                "daily": daily,
-                "ytd": ytd,
-                "headlines": (
-                    get_headlines(
-                        ticker,
-                        limit=5,
-                    )
-                    if with_headlines
-                    else []
-                ),
-            }
+        for result in (
+            data.get("results", [])
+        ):
+
+            title = str(
+                result.get(
+                    "title",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            url = str(
+                result.get(
+                    "url",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            content = str(
+                result.get(
+                    "content",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            if not title or not url:
+                continue
+
+            title_key = (
+                title.lower()
+            )
+
+            if (
+                url in seen_urls
+                or title_key in seen_titles
+            ):
+                continue
+
+            seen_urls.add(url)
+            seen_titles.add(title_key)
+
+            results.append(
+                {
+                    "title": title,
+                    "publisher": (
+                        result.get(
+                            "source",
+                            ""
+                        )
+                        or "Web source"
+                    ),
+                    "url": url,
+                    "snippet": content,
+                }
+            )
+
+    print(
+        f"Total market news results collected: "
+        f"{len(results)}"
+    )
+
+    for i, result in enumerate(
+        results[:limit],
+        start=1,
+    ):
+
+        print(
+            f"  [{i}] "
+            f"{result['title']} — "
+            f"{result['publisher']}"
         )
 
-    return rows
-
+    return results[:limit]
 
 def gather_labeled_etfs(mapping):
     """Gather performance for sector and factor ETF proxies."""
@@ -1296,23 +1402,44 @@ def build_ai_summary(
 
         return "\n".join(lines)
 
-    def fmt_news(rows):
+def fmt_news(rows):
 
-        if not rows:
-            return (
-                "(no market headlines)"
-            )
-
-        return "\n".join(
-            f"[{i}] "
-            f"{h['title']} "
-            f"— {h['publisher']}"
-            for i, h in enumerate(
-                rows,
-                start=1,
-            )
+    if not rows:
+        return (
+            "(no market news search results)"
         )
 
+    lines = []
+
+    for i, h in enumerate(
+        rows,
+        start=1,
+    ):
+
+        lines.append(
+            f"[{i}] {h['title']}"
+        )
+
+        lines.append(
+            f"    Publisher: "
+            f"{h['publisher']}"
+        )
+
+        if h.get("snippet"):
+
+            lines.append(
+                f"    Summary: "
+                f"{h['snippet']}"
+            )
+
+        if h.get("url"):
+
+            lines.append(
+                f"    URL: "
+                f"{h['url']}"
+            )
+
+    return "\n".join(lines)
     def fmt_lookahead(lookahead_data):
 
         lines = []
@@ -1520,22 +1647,36 @@ TICKER REVIEW
 - Do not spend the entire note repeating the daily percentage move.
 
 MARKET STORIES
-- Select up to 5 of the most important DISTINCT stories.
+- Select 3-5 of the most important DISTINCT stories from the supplied
+  market-news search results.
+- Think of this section as a concise morning/evening market briefing
+  similar in spirit to the front page of Bloomberg, Financial Times,
+  CNBC, or Reuters.
+- Prioritize stories based on their importance to investors and their
+  breadth of market impact, not simply on how prominently they appear
+  in the search results.
+- Favor major developments involving:
+  * monetary policy and central banks
+  * inflation, employment and economic data
+  * government policy and regulation
+  * geopolitics and international trade
+  * major moves in rates, currencies, commodities or credit
+  * major industry developments
+  * significant corporate developments with broad market implications
+- Do not force every story to relate to the tracked portfolio.
+- Do not simply describe today's market performance. The Market
+  Dashboard already provides those numbers.
 - Each summary should be roughly 180-250 words.
-- These summaries should be meaningfully larger than ticker summaries.
-- Explain what happened, relevant context, why it matters,
-  and what investors should monitor next.
-- Do NOT duplicate the ticker-review content.
-- Do NOT simply restate index, sector, factor, Treasury,
-  commodity or portfolio movements already shown elsewhere.
-- Prefer stories involving macro developments, policy, geopolitics,
-  market structure, major industry developments, or developments
-  affecting multiple assets.
-- A company-specific story can be used only when it adds material
-  information not already covered in the ticker review.
-- Never invent facts or sources.
+- Explain what happened, the relevant context, why investors care,
+  and what could matter next.
+- Do not duplicate stories that are essentially about the same event.
+- Use only information contained in the supplied search results.
+- Do not invent facts, quotes, events, sources or explanations that
+  are not reasonably supported by the supplied material.
 - source_index MUST correspond to the numbered MARKET HEADLINES list.
-
+- If the supplied search results do not contain enough reliable material
+  for three distinct stories, return only the number of stories that
+  can be supported. Never manufacture additional stories.
 INVESTMENT IMPLICATIONS
 - Bull case: strongest arguments supporting current conditions.
 - Bear case: strongest risks or challenges.
