@@ -3,7 +3,7 @@ import json
 import os
 import yfinance as yf
 from email.mime.text import MIMEText
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pytz
 import requests
 import config
@@ -166,8 +166,60 @@ def gather_group(tickers, with_headlines=False):
     return rows
 
 
+def gather_market_news(limit=8):
+    """Broad market headlines via SPY + macro tickers, deduped."""
+    seen = set()
+    out = []
+    sources = ["SPY", "^GSPC", "QQQ", "TLT", "BZ=F"]
+    for src in sources:
+        for h in get_headlines(src, limit=limit):
+            if h["title"] in seen:
+                continue
+            seen.add(h["title"])
+            out.append(h)
+    return out[:limit]
+
+
+def gather_lookahead():
+    """Pull upcoming earnings + macro data for next ~7 days."""
+    lookahead = {"earnings": [], "macro": []}
+    today = date.today()
+
+    # Earnings: check each tracked ticker for upcoming earnings
+    for t in config.TICKERS + config.PORTFOLIO:
+        try:
+            cal = yf.Ticker(t).calendar
+            if cal is None:
+                continue
+            # yfinance returns either a dict or a DataFrame depending on version
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                if ed and isinstance(ed, list) and ed:
+                    ed = ed[0]
+                if ed and isinstance(ed, (date, datetime)):
+                    ed = ed.date() if isinstance(ed, datetime) else ed
+                    if today <= ed <= today + timedelta(days=7):
+                        lookahead["earnings"].append(
+                            {"ticker": t, "name": company_name(t), "date": ed.isoformat()}
+                        )
+        except Exception as e:
+            print(f"Calendar check failed for {t}: {e}")
+
+    # Macro: yfinance doesn't expose econ calendar cleanly.
+    # Use SPY news filtered for macro keywords as a proxy.
+    macro_keywords = ["fed", "inflation", "cpi", "jobs", "payroll", "rate", "treasury", "gdp"]
+    for h in get_headlines("SPY", limit=15) + get_headlines("^TNX", limit=10):
+        title_lower = h["title"].lower()
+        if any(k in title_lower for k in macro_keywords):
+            lookahead["macro"].append(h)
+            if len(lookahead["macro"]) >= 5:
+                break
+
+    return lookahead
+
+
 # ------------------------------------------------------------------
-# AI summary — single batched call with citations
+# Groq helper
 # ------------------------------------------------------------------
 def _groq_call(prompt, max_tokens=2000, temperature=0.3):
     """Single Groq call. Returns parsed dict or None. Logs raw response on failure."""
@@ -207,13 +259,11 @@ def _groq_call(prompt, max_tokens=2000, temperature=0.3):
 
     raw = body["choices"][0]["message"]["content"]
 
-    # Strip markdown fences if model added them
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:].lstrip()
-    # Trim anything after the last closing brace
     last_brace = raw.rfind("}")
     if last_brace != -1:
         raw = raw[: last_brace + 1]
@@ -226,7 +276,10 @@ def _groq_call(prompt, max_tokens=2000, temperature=0.3):
         return None
 
 
-def build_ai_summary(indices, tickers):
+# ------------------------------------------------------------------
+# AI summary — batched call for tickers + stories + lookahead
+# ------------------------------------------------------------------
+def build_ai_summary(indices, tickers, market_news, lookahead):
     def fmt_indices(rows):
         return "\n".join(
             f"{r['ticker']} ({r['name']}) | {r['price']:.2f} | "
@@ -248,6 +301,24 @@ def build_ai_summary(indices, tickers):
                 lines.append("  (no headlines available)")
         return "\n".join(lines)
 
+    def fmt_news(rows):
+        lines = []
+        for i, h in enumerate(rows, start=1):
+            lines.append(f"[{i}] {h['title']} — {h['publisher']}")
+        return "\n".join(lines) if lines else "(no broad-market headlines available)"
+
+    def fmt_lookahead(la):
+        lines = []
+        if la["earnings"]:
+            lines.append("Upcoming earnings this week:")
+            for e in la["earnings"]:
+                lines.append(f"  {e['date']}: {e['ticker']} ({e['name']})")
+        if la["macro"]:
+            lines.append("\nMacro headlines for context:")
+            for h in la["macro"]:
+                lines.append(f"  - {h['title']} — {h['publisher']}")
+        return "\n".join(lines) if lines else "(no scheduled events found)"
+
     prompt = (
         "You are writing a nightly market review email for a retail investor. "
         "Respond with a single JSON object only. No prose outside the JSON.\n\n"
@@ -255,48 +326,41 @@ def build_ai_summary(indices, tickers):
         f"{fmt_indices(indices)}\n\n"
         "WATCHLIST (with numbered headlines):\n"
         f"{fmt_tickers(tickers)}\n\n"
+        "BROAD MARKET HEADLINES:\n"
+        f"{fmt_news(market_news)}\n\n"
+        "UPCOMING EVENTS / LOOKAHEAD:\n"
+        f"{fmt_lookahead(lookahead)}\n\n"
         "Required JSON schema:\n"
         "{\n"
-        '  "market_overview": "2-4 sentence paragraph. Never empty.",\n'
-        '  "indices": {"<ticker>": "<one-line note>", ...},\n'
         '  "tickers": {\n'
         '    "<ticker>": {"note": "<1-3 sentences>", "cites": [1, 2]}\n'
-        "  }\n"
+        "  },\n"
+        '  "stories": [\n'
+        '    {"title": "<headline title>", "summary": "<~200 word summary>", '
+        '"source_index": <int matching BROAD MARKET HEADLINES list>}\n'
+        "  ],\n"
+        '  "looking_ahead": "<3-5 sentence forward-looking paragraph covering '
+        'upcoming earnings, economic data, and what to watch>"\n'
         "}\n\n"
         "Rules:\n"
-        "- market_overview must be 2-4 sentences, name at least two indices, "
-        "and note a sector or macro theme.\n"
-        "- indices: one sentence per index ticker. Never empty.\n"
         "- tickers: every watchlist ticker is a key. If headlines exist, write 1-3 "
         "sentences grounded in them and cite them inline as [1], [2], listing those "
         "numbers in the cites array. If daily move is under 0.75% and no notable "
         "headline exists, return note=\"\" and cites=[].\n"
+        "- stories: select up to 5 distinct headlines from BROAD MARKET HEADLINES. "
+        "Write ~200 words for each, expanding on the headline with context, "
+        "implications, and what it means for investors. Cite the source_index "
+        "(the number from the list). Do not invent stories.\n"
+        "- looking_ahead: 3-5 sentences. Name specific companies reporting earnings, "
+        "specific economic releases if visible in the lookahead data, and any "
+        "macro themes worth watching. Be concrete, not generic.\n"
         "- Never invent sources. Only cite indices provided.\n"
     )
 
-    parsed = _groq_call(prompt, max_tokens=2000, temperature=0.3)
+    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.35)
 
     if parsed is None:
-        return {
-            "market_overview": (
-                "Market overview unavailable — Groq call failed. "
-                "Check workflow logs for details."
-            ),
-            "indices": {},
-            "tickers": {},
-        }
-
-    # Validate
-    overview = (parsed.get("market_overview") or "").strip()
-    if not overview:
-        overview = (
-            "Market overview unavailable — model returned empty text. "
-            "See index rows for the day's moves."
-        )
-
-    indices_notes = parsed.get("indices") or {}
-    if not isinstance(indices_notes, dict):
-        indices_notes = {}
+        return {"tickers": {}, "stories": [], "looking_ahead": ""}
 
     ticker_notes_raw = parsed.get("tickers") or {}
     ticker_notes = {}
@@ -313,38 +377,44 @@ def build_ai_summary(indices, tickers):
                 cites = []
             ticker_notes[k] = {"note": note, "cites": cites}
 
+    stories_raw = parsed.get("stories") or []
+    stories = []
+    if isinstance(stories_raw, list):
+        for s in stories_raw[:5]:
+            if not isinstance(s, dict):
+                continue
+            stories.append(
+                {
+                    "title": (s.get("title") or "").strip(),
+                    "summary": (s.get("summary") or "").strip(),
+                    "source_index": s.get("source_index"),
+                }
+            )
+
+    looking_ahead = (parsed.get("looking_ahead") or "").strip()
+
     return {
-        "market_overview": overview,
-        "indices": indices_notes,
         "tickers": ticker_notes,
+        "stories": stories,
+        "looking_ahead": looking_ahead,
     }
+
 
 # ------------------------------------------------------------------
 # Email composition
 # ------------------------------------------------------------------
-def _fmt_quote_row(r, note=None):
+def _fmt_quote_row(r):
     arrow = "▲" if r["daily"] >= 0 else "▼"
-    line = (
+    return (
         f"{r['ticker']:<8} {r['name'][:22]:<22} "
         f"{r['price']:>10.2f}   "
         f"{r['daily']:>+6.2f}% {arrow}   "
         f"YTD {r['ytd']:>+6.2f}%"
     )
-    if note:
-        line += f"\n    {note}"
-    return line
 
 
 def _fmt_ticker_block(r, ai_entry):
-    """Ticker quote + optional written note + sources block."""
-    arrow = "▲" if r["daily"] >= 0 else "▼"
-    header = (
-        f"{r['ticker']:<8} {r['name'][:22]:<22} "
-        f"{r['price']:>10.2f}   "
-        f"{r['daily']:>+6.2f}% {arrow}   "
-        f"YTD {r['ytd']:>+6.2f}%"
-    )
-
+    header = _fmt_quote_row(r)
     note = (ai_entry or {}).get("note", "").strip()
     cites = (ai_entry or {}).get("cites", []) or []
 
@@ -353,7 +423,6 @@ def _fmt_ticker_block(r, ai_entry):
 
     lines = [header, f"    {note}"]
 
-    # Build sources list from cited headline indices
     cited_headlines = []
     for idx in cites:
         if 1 <= idx <= len(r["headlines"]):
@@ -364,46 +433,70 @@ def _fmt_ticker_block(r, ai_entry):
         for h in cited_headlines:
             pub = h.get("publisher", "Unknown")
             url = h.get("url", "")
-            if url:
-                lines.append(f"      • {pub} — {url}")
-            else:
-                lines.append(f"      • {pub}")
+            lines.append(f"      • {pub} — {url}" if url else f"      • {pub}")
 
     return "\n".join(lines)
 
 
-def compose_email(indices, tickers, portfolio, ai):
+def compose_email(indices, tickers, portfolio, market_news, lookahead, ai):
     now = datetime.now(pytz.timezone("America/New_York")).strftime(
         "%A, %B %d, %Y"
     )
     parts = [f"Daily Market Review — {now}", "=" * 60, ""]
 
-    # Overview
-    parts.append("MARKET OVERVIEW")
-    parts.append("-" * 60)
-    parts.append(ai.get("market_overview", "").strip() or "(unavailable)")
-    parts.append("")
-
-    # Indices
+    # Indices — quote rows only
     parts.append("INDICES")
     parts.append("-" * 60)
     for r in indices:
-        parts.append(_fmt_quote_row(r, ai.get("indices", {}).get(r["ticker"])))
+        parts.append(_fmt_quote_row(r))
     parts.append("")
 
-    # Tracked tickers
+    # Tracked tickers — with AI notes + sources
     parts.append("TRACKED TICKERS")
     parts.append("-" * 60)
     ticker_ai = ai.get("tickers", {})
     for r in tickers:
         parts.append(_fmt_ticker_block(r, ticker_ai.get(r["ticker"], {})))
-        parts.append("")  # spacing between blocks
+        parts.append("")
 
-    # Portfolio (no AI notes)
+    # Portfolio — quote rows only
     parts.append("PORTFOLIO")
     parts.append("-" * 60)
     for r in portfolio:
         parts.append(_fmt_quote_row(r))
+    parts.append("")
+
+    # Market stories — ~5 headlines with ~200 word summaries
+    parts.append("MARKET STORIES")
+    parts.append("-" * 60)
+    for s in ai.get("stories", []):
+        title = s.get("title", "").strip()
+        summary = s.get("summary", "").strip()
+        src_idx = s.get("source_index")
+        if title:
+            parts.append(title.upper())
+        if summary:
+            # Wrap at ~78 chars for readability
+            words = summary.split()
+            line = ""
+            for w in words:
+                if len(line) + len(w) + 1 > 78:
+                    parts.append(line)
+                    line = w
+                else:
+                    line = f"{line} {w}".strip()
+            if line:
+                parts.append(line)
+        if isinstance(src_idx, int) and 1 <= src_idx <= len(market_news):
+            h = market_news[src_idx - 1]
+            parts.append(f"Source: {h['publisher']} — {h.get('url', '')}")
+        parts.append("")
+
+    # Looking ahead
+    parts.append("LOOKING AHEAD")
+    parts.append("-" * 60)
+    la = ai.get("looking_ahead", "").strip()
+    parts.append(la if la else "(unavailable)")
     parts.append("")
 
     parts.append("-" * 60)
@@ -436,16 +529,18 @@ def main():
     indices = gather_group(config.INDICES, with_headlines=False)
     tickers = gather_group(config.TICKERS, with_headlines=True)
     portfolio = gather_group(config.PORTFOLIO, with_headlines=False)
+    market_news = gather_market_news(limit=8)
+    lookahead = gather_lookahead()
 
     if not indices and not tickers and not portfolio:
         print("No data gathered — exiting without email.")
         return
 
-    ai = build_ai_summary(indices, tickers)
+    ai = build_ai_summary(indices, tickers, market_news, lookahead)
 
     today_str = date.today().strftime("%a, %b %d %Y")
     subject = f"Daily Market Review — {today_str}"
-    body = compose_email(indices, tickers, portfolio, ai)
+    body = compose_email(indices, tickers, portfolio, market_news, lookahead, ai)
     send_email(subject, body)
     print("Daily review email sent.")
 
