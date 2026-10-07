@@ -45,7 +45,8 @@ config.GIST_TOKEN = os.environ.get(
 )
 
 config.TAVILY_API_KEY = os.environ.get(
-    "TAVILY_API_KEY", config.TAVILY_API_KEY
+    "TAVILY_API_KEY",
+    getattr(config, "TAVILY_API_KEY", ""),
 )
 
 MARKET_TZ = pytz.timezone("America/New_York")
@@ -323,10 +324,7 @@ def company_name(ticker):
 
     return ticker
 
-
-# News helpers
-
-# News helpers
+# News and market-group helpers
 
 def get_headlines(ticker, limit=5):
     """Return deduplicated Yahoo Finance headlines for a ticker."""
@@ -337,7 +335,10 @@ def get_headlines(ticker, limit=5):
             or []
         )
 
-    except Exception:
+    except Exception as e:
+        print(
+            f"Yahoo headlines failed for {ticker}: {e}"
+        )
         return []
 
     out = []
@@ -412,12 +413,65 @@ def get_headlines(ticker, limit=5):
     return out
 
 
+def gather_group(
+    tickers,
+    with_headlines=False,
+    headline_limit=5,
+):
+    """
+    Gather quote/performance data for a group of tickers.
+
+    Returns rows in the format expected by the HTML tables
+    and AI analysis.
+    """
+
+    rows = []
+
+    for ticker in tickers:
+
+        current, daily, ytd = (
+            get_quote_and_ytd(
+                ticker
+            )
+        )
+
+        if current is None:
+            print(
+                f"Could not fetch data for {ticker}"
+            )
+            continue
+
+        row = {
+            "ticker": ticker,
+            "name": company_name(ticker),
+            "price": current,
+            "daily": daily,
+            "ytd": ytd,
+            "headlines": [],
+        }
+
+        if with_headlines:
+
+            row["headlines"] = (
+                get_headlines(
+                    ticker,
+                    limit=headline_limit,
+                )
+            )
+
+        rows.append(row)
+
+    return rows
+
+
 def gather_market_news(limit=10):
     """
     Search the current web for major financial-market stories.
 
-    The search is deliberately broad rather than ticker-driven.
-    Groq will later select the most important distinct stories.
+    This is deliberately broad rather than ticker-driven. The goal is
+    to surface the day's important investor-relevant stories, similar
+    to a concise financial front page, and then let Groq select the
+    most important distinct stories.
     """
 
     print(
@@ -440,22 +494,22 @@ def gather_market_news(limit=10):
 
     queries = [
         (
-            f"major financial market news "
-            f"stocks bonds economy today "
+            "major financial market news "
+            "stocks bonds economy today "
             f"{today.isoformat()}"
         ),
         (
-            f"Wall Street markets Federal Reserve "
-            f"interest rates inflation today "
+            "Wall Street markets Federal Reserve "
+            "interest rates inflation today "
             f"{today.isoformat()}"
         ),
         (
-            f"major business financial news "
-            f"investors today "
+            "major business financial news "
+            "investors today "
             f"{today.isoformat()}"
         ),
         (
-            f"oil gold dollar Treasury markets "
+            "oil gold dollar Treasury markets "
             f"today {today.isoformat()}"
         ),
     ]
@@ -565,13 +619,17 @@ def gather_market_news(limit=10):
                 }
             )
 
+    # Keep the strongest first results while preventing one query
+    # from dominating the entire list.
+    results = results[:limit]
+
     print(
-        f"Total market news results collected: "
+        "Total market news results collected: "
         f"{len(results)}"
     )
 
     for i, result in enumerate(
-        results[:limit],
+        results,
         start=1,
     ):
 
@@ -581,7 +639,8 @@ def gather_market_news(limit=10):
             f"{result['publisher']}"
         )
 
-    return results[:limit]
+    return results
+
 
 def gather_labeled_etfs(mapping):
     """Gather performance for sector and factor ETF proxies."""
@@ -614,7 +673,6 @@ def gather_labeled_etfs(mapping):
         )
 
     return rows
-
 
 # Portfolio calculations
 
