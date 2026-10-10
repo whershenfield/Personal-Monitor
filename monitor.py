@@ -2595,7 +2595,7 @@ def build_ticker_review(
     )
 
 
-```python
+python
 def build_market_stories(
     market_news,
     ai,
