@@ -450,14 +450,34 @@ def gather_group(
             "headlines": [],
         }
 
-        if with_headlines:
+if with_headlines:
 
-            row["headlines"] = (
-                get_headlines(
-                    ticker,
-                    limit=headline_limit,
-                )
-            )
+    row["headlines"] = get_headlines(
+        ticker,
+        limit=headline_limit,
+    )
+
+    # Supplement Yahoo's feed when it returns too little coverage.
+    if len(row["headlines"]) < headline_limit:
+        extra = search_company_news(
+            ticker,
+            limit=headline_limit,
+        )
+
+        seen_titles = {
+            h["title"].strip().lower()
+            for h in row["headlines"]
+        }
+
+        for headline in extra:
+            key = headline["title"].strip().lower()
+
+            if key not in seen_titles:
+                row["headlines"].append(headline)
+                seen_titles.add(key)
+
+            if len(row["headlines"]) >= headline_limit:
+                break
 
         rows.append(row)
 
@@ -641,6 +661,94 @@ def gather_market_news(limit=10):
 
     return results
 
+def search_company_news(ticker, limit=5):
+    """Search broadly for company-specific news using Tavily."""
+
+    api_key = getattr(
+        config,
+        "TAVILY_API_KEY",
+        "",
+    )
+
+    if not api_key:
+        return []
+
+    name = company_name(ticker)
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            headers={
+                "Content-Type": "application/json",
+            },
+            json={
+                "api_key": api_key,
+                "query": (
+                    f'"{name}" {ticker} company stock news'
+                ),
+                "topic": "news",
+                "search_depth": "advanced",
+                "days": 7,
+                "max_results": limit,
+                "include_answer": False,
+            },
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Company news search failed for "
+                f"{ticker}: {response.status_code}"
+            )
+            return []
+
+        results = response.json().get(
+            "results",
+            [],
+        )
+
+    except Exception as e:
+        print(
+            f"Company news search exception for "
+            f"{ticker}: {e}"
+        )
+        return []
+
+    headlines = []
+    seen = set()
+
+    for result in results:
+        title = str(
+            result.get("title", "") or ""
+        ).strip()
+
+        url = str(
+            result.get("url", "") or ""
+        ).strip()
+
+        if not title or not url:
+            continue
+
+        key = title.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        headlines.append({
+            "title": title,
+            "publisher": (
+                result.get("source")
+                or "Web source"
+            ),
+            "url": url,
+            "snippet": str(
+                result.get("content", "") or ""
+            ).strip(),
+        })
+
+    return headlines
 
 def gather_labeled_etfs(mapping):
     """Gather performance for sector and factor ETF proxies."""
@@ -1700,9 +1808,14 @@ TICKER REVIEW
   identifiable catalysts.
 - If headlines exist, ground the summary in those headlines.
 - Cite relevant headline numbers from the ticker's headline list.
-- If no relevant headline exists, explicitly say that no material
-  company-specific headline was surfaced in the available feed.
-- Do not fabricate company events, facts or sources.
+- If Yahoo Finance provides no relevant headline, use any supplied
+  broader web-search results for that company.
+- When a tracked stock has a material daily move (roughly 1% or more)
+  and the available evidence does not explain it, explicitly state
+  that the move remains unexplained by the sources reviewed.
+- Do not infer a cause from the price movement alone.
+- Distinguish confirmed catalysts from plausible but unverified
+  explanations.- Do not fabricate company events, facts or sources.
 - Do not spend the entire note repeating the daily percentage move.
 
 MARKET STORIES
@@ -2520,11 +2633,16 @@ def build_market_stories(
             "source_index"
         )
 
-        if title:
+if title:
+    html += f"<h2>{title}</h2>"
 
-            html += (
-                f"<h2>{title}</h2>"
-            )
+    if (
+        isinstance(source_index, int)
+        and 1 <= source_index <= len(market_news)
+    ):
+        source = market_news[source_index - 1]
+
+        html += build_source_link(source)
 
         if summary:
 
@@ -2545,24 +2663,6 @@ def build_market_stories(
                     f"{html_escape(paragraph)}"
                     f"</p>"
                 )
-
-        if (
-            isinstance(
-                source_index,
-                int,
-            )
-            and
-            1 <= source_index
-            <= len(market_news)
-        ):
-
-            html += (
-                build_source_link(
-                    market_news[
-                        source_index - 1
-                    ]
-                )
-            )
 
     return html
 
@@ -2885,7 +2985,14 @@ li {{
 
 {build_quote_table(
     tickers,
-    include_price=False,
+    include_price=True,
+)}
+
+<h2>Company-by-Company Review</h2>
+
+{build_ticker_review(
+    tickers,
+    ai
 )}
 
 
@@ -2933,7 +3040,7 @@ YTD
 
 {build_quote_table(
     portfolio,
-    include_price=False,
+    include_price=True,
 )}
 
 
@@ -2946,19 +3053,10 @@ YTD
 )}
 
 
-<!-- 4. Ticker Review -->
 
-<h1>4. Ticker Review</h1>
+<!-- 4. Top Market Stories -->
 
-{build_ticker_review(
-    tickers,
-    ai
-)}
-
-
-<!-- 5. Top Market Stories -->
-
-<h1>5. Top Market Stories</h1>
+<h1>4. Top Market Stories</h1>
 
 {build_market_stories(
     market_news,
@@ -2966,9 +3064,9 @@ YTD
 )}
 
 
-<!-- 6. Investment Implications -->
+<!-- 5. Investment Implications -->
 
-<h1>6. Investment Implications</h1>
+<h1>5. Investment Implications</h1>
 
 
 <h2>Bull Case</h2>
@@ -3010,9 +3108,9 @@ YTD
 )}
 
 
-<!-- 7. Looking Ahead -->
+<!-- 6. Looking Ahead -->
 
-<h1>7. Looking Ahead</h1>
+<h1>6. Looking Ahead</h1>
 
 
 <h2>Upcoming Earnings</h2>
@@ -3090,9 +3188,9 @@ YTD
 )}
 
 
-<!-- 8. Bottom Line -->
+<!-- 7. Bottom Line -->
 
-<h1>8. Bottom Line</h1>
+<h1>7. Bottom Line</h1>
 
 {build_paragraph(
     ai.get(
