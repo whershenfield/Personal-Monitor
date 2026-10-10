@@ -2595,6 +2595,7 @@ def build_ticker_review(
     )
 
 
+```python
 def build_market_stories(
     market_news,
     ai,
@@ -2612,7 +2613,6 @@ def build_market_stories(
     html = ""
 
     for story in stories:
-
         title = html_escape(
             str(
                 story.get(
@@ -2635,31 +2635,25 @@ def build_market_stories(
             "source_index"
         )
 
-if title:
-    html += f"<h2>{title}</h2>"
+        if title:
+            html += f"<h2>{title}</h2>"
 
-    if (
-        isinstance(source_index, int)
-        and 1 <= source_index <= len(market_news)
-    ):
-        source = market_news[source_index - 1]
-
-        html += build_source_link(source)
+        if (
+            isinstance(source_index, int)
+            and 1 <= source_index <= len(market_news)
+        ):
+            source = market_news[source_index - 1]
+            html += build_source_link(source)
 
         if summary:
-
             # Preserve paragraph breaks from the model.
-
             paragraphs = [
                 p.strip()
-                for p in summary.split(
-                    "\n\n"
-                )
+                for p in summary.split("\n\n")
                 if p.strip()
             ]
 
             for paragraph in paragraphs:
-
                 html += (
                     f"<p>"
                     f"{html_escape(paragraph)}"
@@ -2667,7 +2661,6 @@ if title:
                 )
 
     return html
-
 
 def build_paragraph(
     text
