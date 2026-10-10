@@ -413,32 +413,15 @@ def get_headlines(ticker, limit=5):
     return out
 
 
-def gather_group(
-    tickers,
-    with_headlines=False,
-    headline_limit=5,
-):
-    """
-    Gather quote/performance data for a group of tickers.
 
-    Returns rows in the format expected by the HTML tables
-    and AI analysis.
-    """
-
+def gather_group(tickers, with_headlines=False, headline_limit=5):
     rows = []
 
     for ticker in tickers:
-
-        current, daily, ytd = (
-            get_quote_and_ytd(
-                ticker
-            )
-        )
+        current, daily, ytd = get_quote_and_ytd(ticker)
 
         if current is None:
-            print(
-                f"Could not fetch data for {ticker}"
-            )
+            print(f"Skipping {ticker}: no quote data available")
             continue
 
         row = {
@@ -450,12 +433,31 @@ def gather_group(
             "headlines": [],
         }
 
-if with_headlines:
+        if with_headlines:
+            yahoo_headlines = get_headlines(ticker, limit=headline_limit)
+            company_headlines = search_company_news(
+                ticker, limit=headline_limit
+            )
 
-    row["headlines"] = get_headlines(
-        ticker,
-        limit=headline_limit,
-    )
+            combined = []
+            seen_titles = set()
+
+            for headline in yahoo_headlines + company_headlines:
+                title = headline.get("title", "").strip()
+                key = title.lower()
+
+                if title and key not in seen_titles:
+                    seen_titles.add(key)
+                    combined.append(headline)
+
+                if len(combined) >= headline_limit:
+                    break
+
+            row["headlines"] = combined
+
+        rows.append(row)
+
+    return rows
 
     # Supplement Yahoo's feed when it returns too little coverage.
     if len(row["headlines"]) < headline_limit:
