@@ -2594,8 +2594,6 @@ def build_ticker_review(
         or "<p>Unavailable.</p>"
     )
 
-
-python
 def build_market_stories(
     market_news,
     ai,
