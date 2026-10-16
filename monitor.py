@@ -1359,13 +1359,14 @@ raw = (
     or ""
 ).strip()
 
+if not raw:
+    print("Groq returned empty message content.")
+    return None
+
 print(
     f"Groq response length: {len(raw)} characters"
 )
 
-if not raw:
-    print("Groq returned empty message content.")
-    return None
     # Remove markdown code fences if present.
 
     if raw.startswith("```"):
