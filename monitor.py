@@ -2569,6 +2569,7 @@ def build_ticker_review(
         or "<p>Unavailable.</p>"
     )
 
+
 def build_market_stories(
     market_news,
     ai,
@@ -2586,15 +2587,13 @@ def build_market_stories(
     html = ""
 
     for story in stories:
-        title = html_escape(
-            str(
-                story.get(
-                    "title",
-                    ""
-                )
-                or ""
-            ).strip()
-        )
+        raw_title = str(
+            story.get(
+                "title",
+                ""
+            )
+            or ""
+        ).strip()
 
         summary = str(
             story.get(
@@ -2608,14 +2607,36 @@ def build_market_stories(
             "source_index"
         )
 
-        if title:
-            html += f"<h2>{title}</h2>"
+        # Match the story to its original news source.
+        source = None
 
         if (
             isinstance(source_index, int)
             and 1 <= source_index <= len(market_news)
         ):
             source = market_news[source_index - 1]
+
+        # Append the publisher to the headline.
+        publisher = (
+            str(source.get("publisher", "")).strip()
+            if source
+            else ""
+        )
+
+        if publisher:
+            # Avoid adding the publisher twice.
+            suffix = f" | {publisher}"
+
+            if not raw_title.endswith(suffix):
+                raw_title = f"{raw_title}{suffix}"
+
+        title = html_escape(raw_title)
+
+        if title:
+            html += f"<h2>{title}</h2>"
+
+        # Keep the clickable source citation.
+        if source:
             html += build_source_link(source)
 
         if summary:
