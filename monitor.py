@@ -1342,13 +1342,30 @@ def _groq_call(
 
         return None
 
-    raw = (
-        body["choices"][0]
-        ["message"]
-        ["content"]
-        .strip()
-    )
+choice = body["choices"][0]
 
+print(
+    "Groq finish_reason: "
+    f"{choice.get('finish_reason')}"
+)
+
+print(
+    "Groq usage: "
+    f"{json.dumps(body.get('usage', {}))}"
+)
+
+raw = (
+    choice.get("message", {}).get("content")
+    or ""
+).strip()
+
+print(
+    f"Groq response length: {len(raw)} characters"
+)
+
+if not raw:
+    print("Groq returned empty message content.")
+    return None
     # Remove markdown code fences if present.
 
     if raw.startswith("```"):
