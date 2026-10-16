@@ -1259,24 +1259,25 @@ def _groq_call(
     max_tokens=6500,
     temperature=0.3,
 ):
-    """Make a Groq API call and return the parsed JSON response."""
+    """Call Groq, log useful diagnostics, and parse its JSON response."""
 
     groq_url = (
         "https://api.groq.com/openai/v1/"
         "chat/completions"
     )
 
+    api_key = getattr(config, "GROQ_API_KEY", "")
+    if not api_key:
+        print("Groq API key is missing (GROQ_API_KEY).")
+        return None
+
     headers = {
-        "Authorization": (
-            f"Bearer {config.GROQ_API_KEY}"
-        ),
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
     payload = {
-        "model": (
-            "openai/gpt-oss-120b"
-        ),
+        "model": "openai/gpt-oss-120b",
         "max_tokens": max_tokens,
         "temperature": temperature,
         "messages": [
@@ -1287,153 +1288,109 @@ def _groq_call(
         ],
     }
 
-    try:
+    print(
+        "Calling Groq: "
+        f"model={payload['model']}, "
+        f"prompt_length={len(prompt)}, "
+        f"max_tokens={max_tokens}"
+    )
 
+    try:
         response = requests.post(
             groq_url,
             headers=headers,
-            data=json.dumps(payload),
+            json=payload,
             timeout=120,
         )
-
     except Exception as e:
-        print(
-            f"Groq request exception: {e}"
-        )
+        print(f"Groq request exception: {type(e).__name__}: {e}")
         return None
 
-    print(
-        f"Groq HTTP status: "
-        f"{response.status_code}"
-    )
+    print(f"Groq HTTP status: {response.status_code}")
 
     if response.status_code != 200:
-
-        print(
-            "Groq error body: "
-            f"{response.text[:1000]}"
-        )
-
+        print(f"Groq error body: {response.text[:2000]}")
         return None
 
     try:
-
         body = response.json()
-
     except Exception as e:
-
         print(
-            "Groq non-JSON body: "
-            f"{response.text[:500]} "
-            f"({e})"
+            "Groq returned a non-JSON HTTP response: "
+            f"{type(e).__name__}: {e}; body={response.text[:1000]}"
         )
-
         return None
 
-    if (
-        "choices" not in body
-        or not body["choices"]
-    ):
-
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
         print(
-            "Groq response missing "
-            f"'choices': {json.dumps(body)[:1000]}"
+            "Groq response missing a usable 'choices' list: "
+            f"{json.dumps(body)[:2000]}"
         )
-
         return None
 
-choice = body["choices"][0]
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    content = message.get("content")
 
-print(
-    "Groq finish_reason: "
-    f"{choice.get('finish_reason')}"
-)
+    print(f"Groq finish_reason: {choice.get('finish_reason')}")
+    print(f"Groq usage: {json.dumps(body.get('usage', {}))}")
 
-print(
-    "Groq usage: "
-    f"{json.dumps(body.get('usage', {}))}"
-)
+    # Some API responses can return content as None or an unexpected type.
+    if isinstance(content, str):
+        raw = content.strip()
+    else:
+        raw = ""
 
-raw = (
-    choice.get("message", {}).get("content")
-    or ""
-).strip()
+    print(f"Groq response length: {len(raw)} characters")
 
-if not raw:
-    print("Groq returned empty message content.")
-    return None
+    if not raw:
+        print(
+            "Groq returned empty message content. "
+            f"Message metadata: {json.dumps(message)[:1000]}"
+        )
+        return None
 
-print(
-    f"Groq response length: {len(raw)} characters"
-)
-
-    # Remove markdown code fences if present.
-
+    # Remove Markdown code fences if present.
     if raw.startswith("```"):
-
         lines = raw.splitlines()
 
-        if (
-            lines
-            and
-            lines[0]
-            .strip()
-            .startswith("```")
-        ):
+        if lines and lines[0].strip().startswith("```"):
             lines = lines[1:]
 
-        if (
-            lines
-            and
-            lines[-1]
-            .strip()
-            == "```"
-        ):
+        if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
 
-        raw = "\n".join(
-            lines
-        ).strip()
+        raw = "\n".join(lines).strip()
 
-    # Extract the JSON object from the response.
+    # Extract the outer JSON object if the model added surrounding text.
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
 
-    first_brace = raw.find(
-        "{"
-    )
-
-    last_brace = raw.rfind(
-        "}"
-    )
-
-    if (
-        first_brace != -1
-        and
-        last_brace != -1
-    ):
-
-        raw = raw[
-            first_brace:
-            last_brace + 1
-        ]
+    if first_brace != -1 and last_brace != -1 and last_brace >= first_brace:
+        raw = raw[first_brace:last_brace + 1]
 
     try:
-
-        return json.loads(
-            raw
-        )
-
+        parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-
-        print(
-            f"Groq JSON parse failed: {e}"
-        )
-
-        print(
-            "Raw content: "
-            f"{raw[:2000]}"
-        )
-
+        print(f"Groq JSON parse failed: {e}")
+        print(f"Groq raw content (first 4000 chars): {raw[:4000]}")
+        if choice.get("finish_reason") == "length":
+            print(
+                "Groq output appears to have hit the token limit. "
+                "Reduce the requested output length or split the request."
+            )
         return None
+
+    if not isinstance(parsed, dict):
+        print(
+            "Groq JSON parsed successfully, but the top-level value "
+            f"was {type(parsed).__name__}, not an object."
+        )
+        return None
+
+    print(f"Groq JSON parsed successfully; keys={list(parsed.keys())}")
+    return parsed
 
 
 # AI analysis
