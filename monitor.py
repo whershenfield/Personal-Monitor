@@ -107,6 +107,30 @@ PORTFOLIO_WEIGHTS = getattr(
     {},
 )
 
+INDEX_PORTFOLIO = getattr(
+    config,
+    "INDEX_PORTFOLIO",
+    [],
+)
+
+INDEX_PORTFOLIO_WEIGHTS = getattr(
+    config,
+    "INDEX_PORTFOLIO_WEIGHTS",
+    {},
+)
+
+AVANTIS_PORTFOLIO = getattr(
+    config,
+    "AVANTIS_PORTFOLIO",
+    [],
+)
+
+AVANTIS_PORTFOLIO_WEIGHTS = getattr(
+    config,
+    "AVANTIS_PORTFOLIO_WEIGHTS",
+    {},
+)
+
 
 # Date helpers
 
@@ -789,10 +813,14 @@ def gather_labeled_etfs(mapping):
 def calculate_weighted_portfolio_return(
     rows,
     field,
+    weights=None,
 ):
-    """Calculate a weighted portfolio return when weights are available."""
+    """Calculate a weighted return using the supplied portfolio weights."""
 
-    if not PORTFOLIO_WEIGHTS:
+    if weights is None:
+        weights = PORTFOLIO_WEIGHTS
+
+    if not weights:
         return None
 
     weighted_sum = 0.0
@@ -802,11 +830,7 @@ def calculate_weighted_portfolio_return(
 
         ticker = row["ticker"]
         value = row.get(field)
-        weight = (
-            PORTFOLIO_WEIGHTS.get(
-                ticker
-            )
-        )
+        weight = weights.get(ticker)
 
         if value is None:
             continue
@@ -2569,7 +2593,6 @@ def build_ticker_review(
         or "<p>Unavailable.</p>"
     )
 
-
 def build_market_stories(
     market_news,
     ai,
@@ -2587,13 +2610,15 @@ def build_market_stories(
     html = ""
 
     for story in stories:
-        raw_title = str(
-            story.get(
-                "title",
-                ""
-            )
-            or ""
-        ).strip()
+        title = html_escape(
+            str(
+                story.get(
+                    "title",
+                    ""
+                )
+                or ""
+            ).strip()
+        )
 
         summary = str(
             story.get(
@@ -2607,36 +2632,14 @@ def build_market_stories(
             "source_index"
         )
 
-        # Match the story to its original news source.
-        source = None
+        if title:
+            html += f"<h2>{title}</h2>"
 
         if (
             isinstance(source_index, int)
             and 1 <= source_index <= len(market_news)
         ):
             source = market_news[source_index - 1]
-
-        # Append the publisher to the headline.
-        publisher = (
-            str(source.get("publisher", "")).strip()
-            if source
-            else ""
-        )
-
-        if publisher:
-            # Avoid adding the publisher twice.
-            suffix = f" | {publisher}"
-
-            if not raw_title.endswith(suffix):
-                raw_title = f"{raw_title}{suffix}"
-
-        title = html_escape(raw_title)
-
-        if title:
-            html += f"<h2>{title}</h2>"
-
-        # Keep the clickable source citation.
-        if source:
             html += build_source_link(source)
 
         if summary:
@@ -2686,6 +2689,8 @@ def compose_email(
     factors,
     tickers,
     portfolio,
+    index_portfolio,
+    avantis_portfolio,
     macro,
     market_news,
     lookahead,
@@ -2948,6 +2953,45 @@ li {{
 )}
 
 
+<h2>Portfolio Movements</h2>
+
+"""
+
+    # Show the three model portfolios in the requested order.
+    portfolio_definitions = [
+        ("Index Portfolio", index_portfolio, INDEX_PORTFOLIO_WEIGHTS),
+        ("Avantis Portfolio", avantis_portfolio, AVANTIS_PORTFOLIO_WEIGHTS),
+        ("Current Portfolio", portfolio, PORTFOLIO_WEIGHTS),
+    ]
+
+    for portfolio_name, portfolio_rows, portfolio_weights in portfolio_definitions:
+        daily_return = calculate_weighted_portfolio_return(
+            portfolio_rows, "daily", portfolio_weights
+        )
+        ytd_return = calculate_weighted_portfolio_return(
+            portfolio_rows, "ytd", portfolio_weights
+        )
+
+        html += f"<h3>{html_escape(portfolio_name)}</h3>"
+
+        if daily_return is not None and ytd_return is not None:
+            html += f"""
+<p>
+<strong>Weighted Return:</strong>
+<span class="{pct_class(daily_return)}">{format_pct(daily_return)}</span>
+today
+&nbsp;&nbsp;|&nbsp;&nbsp;
+YTD
+<span class="{pct_class(ytd_return)}">{format_pct(ytd_return)}</span>
+</p>
+"""
+        else:
+            html += "<p>Weighted return unavailable; check portfolio weights and holdings data.</p>"
+
+        html += build_quote_table(portfolio_rows, include_price=True)
+
+    html += f"""
+
 <h2>Sector Performance</h2>
 
 {build_labeled_table(
@@ -2982,54 +3026,6 @@ li {{
 {build_ticker_review(
     tickers,
     ai
-)}
-
-
-<h2>Portfolio Movements</h2>
-"""
-
-    # Add weighted portfolio performance when available.
-
-    portfolio_daily = (
-        calculate_weighted_portfolio_return(
-            portfolio,
-            "daily",
-        )
-    )
-
-    portfolio_ytd = (
-        calculate_weighted_portfolio_return(
-            portfolio,
-            "ytd",
-        )
-    )
-
-    if (
-        portfolio_daily is not None
-        and
-        portfolio_ytd is not None
-    ):
-
-        html += f"""
-<p>
-<strong>Weighted Portfolio:</strong>
-<span class="{pct_class(portfolio_daily)}">
-{format_pct(portfolio_daily)}
-</span>
-today
-&nbsp;&nbsp;|&nbsp;&nbsp;
-YTD
-<span class="{pct_class(portfolio_ytd)}">
-{format_pct(portfolio_ytd)}
-</span>
-</p>
-"""
-
-    html += f"""
-
-{build_quote_table(
-    portfolio,
-    include_price=True,
 )}
 
 
@@ -3322,6 +3318,18 @@ def main():
         with_headlines=False,
     )
 
+    print("Gathering index portfolio...")
+    index_portfolio = gather_group(
+        INDEX_PORTFOLIO,
+        with_headlines=False,
+    )
+
+    print("Gathering Avantis portfolio...")
+    avantis_portfolio = gather_group(
+        AVANTIS_PORTFOLIO,
+        with_headlines=False,
+    )
+
     print(
         "Gathering sectors..."
     )
@@ -3368,6 +3376,8 @@ def main():
         not indices
         and not tickers
         and not portfolio
+        and not index_portfolio
+        and not avantis_portfolio
     ):
 
         print(
@@ -3414,6 +3424,8 @@ def main():
         factors=factors,
         tickers=tickers,
         portfolio=portfolio,
+        index_portfolio=index_portfolio,
+        avantis_portfolio=avantis_portfolio,
         macro=macro,
         market_news=market_news,
         lookahead=lookahead,
