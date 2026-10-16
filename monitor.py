@@ -13,6 +13,7 @@ import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
+from urllib.parse import urlparse
 
 import config
 
@@ -339,14 +340,50 @@ def get_quote_and_ytd(ticker):
         return None, None, None
 
 
+# Built-in display names for the symbols used by this report. Values in
+# config.TICKER_NAMES override these defaults.
+DEFAULT_TICKER_NAMES = {
+    "^GSPC": "S&P 500 Index",
+    "^IXIC": "Nasdaq Composite Index",
+    "^RUT": "Russell 2000 Index",
+    "^DJI": "Dow Jones Industrial Average",
+    "EFA": "iShares MSCI EAFE ETF",
+    "^GSPTSE": "S&P/TSX Composite Index",
+    "EL.PA": "EssilorLuxottica",
+    "SPGI": "S&P Global",
+    "CAUS.TO": "Avantis CIBC U.S. Equity ETF",
+    "CALV.TO": "Avantis CIBC U.S. Large Cap Value ETF",
+    "VCN.TO": "Vanguard FTSE Canada All Cap Index ETF",
+    "CADE.TO": "Avantis CIBC International Equity ETF",
+    "ZSP.TO": "BMO S&P 500 Index ETF",
+    "ZEA.TO": "BMO MSCI EAFE Index ETF",
+    "CACE.TO": "Avantis CIBC Canadian Equity ETF",
+}
+
 @lru_cache(maxsize=None)
 def company_name(ticker):
-    """Return a display name without using Yahoo's fundamentals endpoint."""
+    """Return a readable display name for a tracked stock, index, or ETF."""
 
-    if ticker in TICKER_NAMES:
-        return TICKER_NAMES[ticker]
+    return TICKER_NAMES.get(
+        ticker,
+        DEFAULT_TICKER_NAMES.get(ticker, ticker),
+    )
 
-    return ticker
+
+def news_publisher(result):
+    """Return the publisher name, falling back to the article URL's domain."""
+
+    source = str(result.get("source") or "").strip()
+    if source:
+        return source
+
+    url = str(result.get("url") or "").strip()
+    hostname = urlparse(url).hostname or ""
+    hostname = hostname.lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+
+    return hostname or "Unknown source"
 
 # News and market-group helpers
 
@@ -653,13 +690,7 @@ def gather_market_news(limit=10):
             results.append(
                 {
                     "title": title,
-                    "publisher": (
-                        result.get(
-                            "source",
-                            ""
-                        )
-                        or "Web source"
-                    ),
+                    "publisher": news_publisher(result),
                     "url": url,
                     "snippet": content,
                 }
@@ -764,10 +795,7 @@ def search_company_news(ticker, limit=5):
 
         headlines.append({
             "title": title,
-            "publisher": (
-                result.get("source")
-                or "Web source"
-            ),
+            "publisher": news_publisher(result),
             "url": url,
             "snippet": str(
                 result.get("content", "") or ""
