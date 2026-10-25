@@ -3,8 +3,10 @@ import json
 import os
 import csv
 import io
+import re
 from functools import lru_cache
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time as dtime, timedelta
+from email.utils import parsedate_to_datetime
 
 import yfinance as yf
 import pytz
@@ -70,13 +72,20 @@ DEFAULT_SECTOR_ETFS = {
 
 
 # Default factor/style ETF proxies; can be overridden in config.py.
+# AUDIT FIX: the previous map mixed index families (CRSP growth/value via
+# VUG/VTV next to MSCI factor funds). Style now uses the Russell 1000
+# Growth/Value pair (the institutional style benchmarks), factors use the
+# iShares MSCI USA factor family, and equal weight is added as a breadth /
+# concentration gauge. Each row is also shown relative to FACTOR_BENCHMARK so
+# the factor effect is separated from market beta.
 DEFAULT_FACTOR_ETFS = {
-    "Growth": "VUG",
-    "Momentum": "MTUM",
-    "Quality": "QUAL",
-    "Value": "VTV",
-    "Minimum Volatility": "USMV",
-    "Small Cap": "IWM",
+    "Growth (Russell 1000 Growth)": "IWF",
+    "Value (Russell 1000 Value)": "IWD",
+    "Momentum (MSCI USA Momentum)": "MTUM",
+    "Quality (MSCI USA Quality)": "QUAL",
+    "Minimum Volatility (MSCI USA Min Vol)": "USMV",
+    "Small Cap (Russell 2000)": "IWM",
+    "Equal Weight (S&P 500 Equal Weight)": "RSP",
 }
 
 
@@ -133,6 +142,46 @@ AVANTIS_PORTFOLIO_WEIGHTS = getattr(
 )
 
 
+# Benchmark used for factor "vs market" returns (total-return ETF so it is
+# comparable with the dividend-adjusted factor ETF returns).
+FACTOR_BENCHMARK = getattr(
+    config,
+    "FACTOR_BENCHMARK",
+    "SPY",
+)
+
+
+# Earnings screens. Market caps are in USD.
+UPCOMING_EARNINGS_MIN_MARKET_CAP = getattr(
+    config, "UPCOMING_EARNINGS_MIN_MARKET_CAP", 50e9
+)
+RECENT_EARNINGS_MIN_MARKET_CAP = getattr(
+    config, "RECENT_EARNINGS_MIN_MARKET_CAP", 20e9
+)
+EARNINGS_LOOKAHEAD_DAYS = getattr(
+    config, "EARNINGS_LOOKAHEAD_DAYS", 7
+)
+MAX_UPCOMING_EARNINGS = getattr(
+    config, "MAX_UPCOMING_EARNINGS", 20
+)
+MAX_RECENT_EARNINGS = getattr(
+    config, "MAX_RECENT_EARNINGS", 10
+)
+
+
+# AUDIT: Canadian-listed, unhedged ETFs compared with their USD equivalent.
+# Their return should equal (1 + USD ETF return) * (1 + USD/CAD change) - 1.
+# Any large residual points to a data problem rather than a real return gap.
+CROSS_LISTING_CHECKS = getattr(
+    config,
+    "CROSS_LISTING_CHECKS",
+    {
+        "ZSP.TO": ("SPY", "CAD=X"),
+        "ZEA.TO": ("EFA", "CAD=X"),
+    },
+)
+
+
 # Date helpers
 
 def market_today():
@@ -144,22 +193,73 @@ def next_day(d):
     return d + timedelta(days=1)
 
 
+# AUDIT FIX: every return in the report is anchored to one explicit US
+# session date and the previous US session date, both read from ^GSPC.
+# Previously each instrument used its own last two rows, so any symbol whose
+# latest bar was missing or still NaN silently reported the PRIOR day's move.
+SESSION = {
+    "date": None,
+    "prev_date": None,
+}
+
+
+def session_date():
+    return SESSION["date"] or market_today()
+
+
+def previous_close_dt():
+    """Timestamp of the previous US session's 4:00 pm ET close."""
+
+    prev = SESSION["prev_date"] or (session_date() - timedelta(days=1))
+    return MARKET_TZ.localize(datetime.combine(prev, dtime(16, 0)))
+
+
+# Data-quality audit log, rendered at the end of the email.
+
+AUDIT_LOG = []
+
+
+def audit(message, level="WARN"):
+    """Record a data-quality finding for the console and the email."""
+
+    print(f"[AUDIT {level}] {message}")
+    AUDIT_LOG.append({"level": level, "message": message})
+
+
 # Fresh-data and duplicate-run checks
 
 def has_fresh_data(ticker):
-    """Check whether Yahoo Finance has a daily observation for today."""
+    """
+    Check whether Yahoo Finance has a daily observation for today and record
+    today's and the previous session dates for every later calculation.
+    """
 
     try:
         hist = yf.Ticker(ticker).history(
-            period="5d"
+            period="10d"
         )
 
-        if hist.empty:
+        hist = hist.dropna(subset=["Close"])
+
+        if len(hist) < 2:
             return False
 
-        latest_date = hist.index[-1].date()
+        dates = sorted({ts.date() for ts in hist.index})
 
-        return latest_date == market_today()
+        latest_date = dates[-1]
+
+        if latest_date != market_today():
+            return False
+
+        SESSION["date"] = latest_date
+        SESSION["prev_date"] = dates[-2]
+
+        print(
+            f"Session date {SESSION['date']} "
+            f"(previous close {SESSION['prev_date']})"
+        )
+
+        return True
 
     except Exception as e:
         print(
@@ -264,80 +364,135 @@ def mark_run_success():
 
 # Quote and performance helpers
 
-def get_quote_and_ytd(ticker):
+@lru_cache(maxsize=None)
+def get_quote(ticker):
     """
-    Return current close, daily percentage change, and YTD percentage change.
-    Uses historical closes so after-hours movement does not distort returns.
+    Return price, daily and YTD performance for one symbol as a dict:
+
+        price    unadjusted closing price for display
+        daily    % change vs the ADJUSTED previous close (None if stale)
+        ytd      % change vs the ADJUSTED prior-year final close
+        as_of    date of the bar used
+        stale    True when the symbol has no bar for today's US session
+
+    AUDIT FIXES:
+    - Returns use dividend/split-adjusted closes ("Adj Close"), so an
+      ex-dividend day no longer shows up as a loss.
+    - The current bar must be dated on today's US session. If it is missing
+      (Yahoo lag, a NaN row still being finalised, or a foreign exchange
+      holiday) the row is flagged stale instead of silently reporting the
+      previous day's move.
+    - YTD is measured from the last close of the PRIOR year. The old code used
+      the first close of this year, which dropped the first session's return.
+    - Symbols that print a bar dated after the US session (e.g. FX on a
+      weekend) are cut off at the session date.
+    """
+
+    session = session_date()
+
+    try:
+        hist = yf.Ticker(ticker).history(
+            start=date(session.year - 1, 12, 1).isoformat(),
+            end=(session + timedelta(days=2)).isoformat(),
+            auto_adjust=False,
+            actions=False,
+        )
+    except Exception as e:
+        print(f"Error fetching {ticker}: {e}")
+        return None
+
+    if hist is None or hist.empty or "Close" not in hist:
+        return None
+
+    adj_col = "Adj Close" if "Adj Close" in hist else "Close"
+    hist = hist.dropna(subset=["Close", adj_col])
+
+    # One row per calendar date (yfinance can append a duplicate live row).
+    hist.index = [ts.date() for ts in hist.index]
+    hist = hist[~hist.index.duplicated(keep="last")]
+    hist = hist[hist.index <= session]
+
+    if len(hist) < 2:
+        return None
+
+    as_of = hist.index[-1]
+    price = float(hist["Close"].iloc[-1])
+    adj = hist[adj_col].astype(float)
+
+    stale = as_of != session
+
+    daily = None
+    if not stale:
+        prev_adj = float(adj.iloc[-2])
+        if prev_adj:
+            daily = (float(adj.iloc[-1]) / prev_adj - 1) * 100
+
+    year_start = date(session.year, 1, 1)
+    prior_year = adj[adj.index < year_start]
+
+    if not prior_year.empty:
+        ytd_base = float(prior_year.iloc[-1])
+    else:
+        # Listed this year: fall back to the first available close.
+        ytd_base = float(adj.iloc[0])
+        audit(
+            f"{ticker}: no prior-year close available; YTD measured from "
+            f"first close on {adj.index[0]}."
+        )
+
+    ytd = (float(adj.iloc[-1]) / ytd_base - 1) * 100 if ytd_base else None
+
+    if stale:
+        audit(
+            f"{ticker}: no bar for the {session} session (latest is {as_of}); "
+            "daily return shown as n/a rather than the prior day's move."
+        )
+
+    return {
+        "price": price,
+        "daily": daily,
+        "ytd": ytd,
+        "as_of": as_of,
+        "stale": stale,
+    }
+
+
+def get_after_hours(ticker):
+    """
+    Return the post-market move vs today's regular close, or None.
+
+    Only quotes stamped after today's 4:00 pm ET close are used, so a stale
+    post-market print from the previous evening is never reported.
     """
 
     try:
-        stock = yf.Ticker(ticker)
-
-        start_date = date(
-            market_today().year,
-            1,
-            1,
-        )
-
-        end_date = next_day(
-            market_today()
-        )
-
-        hist = stock.history(
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-            auto_adjust=False,
-        )
-
-        if hist.empty:
-            return None, None, None
-
-        hist = hist.dropna(
-            subset=["Close"]
-        )
-
-        if len(hist) < 2:
-            return None, None, None
-
-        current = float(
-            hist["Close"].iloc[-1]
-        )
-
-        prev_close = float(
-            hist["Close"].iloc[-2]
-        )
-
-        ytd_start = float(
-            hist["Close"].iloc[0]
-        )
-
-        if prev_close == 0:
-            return None, None, None
-
-        if ytd_start == 0:
-            return None, None, None
-
-        daily_pct = (
-            (current - prev_close)
-            / prev_close
-        ) * 100
-
-        ytd_pct = (
-            (current - ytd_start)
-            / ytd_start
-        ) * 100
-
-        return (
-            current,
-            daily_pct,
-            ytd_pct,
-        )
-
+        info = yf.Ticker(ticker).info or {}
     except Exception as e:
-        print(
-            f"Error fetching {ticker}: {e}"
-        )
-        return None, None, None
+        print(f"After-hours quote failed for {ticker}: {e}")
+        return None
+
+    post_price = info.get("postMarketPrice")
+    regular = info.get("regularMarketPrice")
+    post_time = info.get("postMarketTime")
+
+    if not post_price or not regular or not post_time:
+        return None
+
+    try:
+        post_dt = datetime.fromtimestamp(int(post_time), MARKET_TZ)
+    except Exception:
+        return None
+
+    close_dt = MARKET_TZ.localize(datetime.combine(session_date(), dtime(16, 0)))
+
+    if post_dt < close_dt:
+        return None
+
+    return {
+        "price": float(post_price),
+        "pct": (float(post_price) / float(regular) - 1) * 100,
+        "time": post_dt.strftime("%I:%M %p ET").lstrip("0"),
+    }
 
 
 # Built-in display names for the symbols used by this report. Values in
@@ -347,7 +502,11 @@ DEFAULT_TICKER_NAMES = {
     "^IXIC": "Nasdaq Composite Index",
     "^RUT": "Russell 2000 Index",
     "^DJI": "Dow Jones Industrial Average",
-    "EFA": "iShares MSCI EAFE ETF",
+    # AUDIT: EFA is the correct, most liquid proxy for MSCI EAFE; Yahoo does
+    # not carry the MSCI index itself. It is priced in USD (includes FX) and
+    # trades during US hours, so it reflects EAFE through the US close.
+    "EFA": "iShares MSCI EAFE ETF (USD)",
+    "SPY": "SPDR S&P 500 ETF",
     "^GSPTSE": "S&P/TSX Composite Index",
     "EL.PA": "EssilorLuxottica",
     "SPGI": "S&P Global",
@@ -355,8 +514,11 @@ DEFAULT_TICKER_NAMES = {
     "CALV.TO": "Avantis CIBC U.S. Large Cap Value ETF",
     "VCN.TO": "Vanguard FTSE Canada All Cap Index ETF",
     "CADE.TO": "Avantis CIBC International Equity ETF",
-    "ZSP.TO": "BMO S&P 500 Index ETF",
-    "ZEA.TO": "BMO MSCI EAFE Index ETF",
+    # AUDIT: ZSP.TO is the correct ticker (unhedged, CAD). Its gap vs ^GSPC is
+    # the USD/CAD move plus dividends (^GSPC is price-only). See the
+    # cross-listing check in the Data Quality section of the email.
+    "ZSP.TO": "BMO S&P 500 Index ETF (CAD, unhedged)",
+    "ZEA.TO": "BMO MSCI EAFE Index ETF (CAD)",
     "CACE.TO": "Avantis CIBC Canadian Equity ETF",
 }
 
@@ -364,10 +526,63 @@ DEFAULT_TICKER_NAMES = {
 def company_name(ticker):
     """Return a readable display name for a tracked stock, index, or ETF."""
 
-    return TICKER_NAMES.get(
-        ticker,
-        DEFAULT_TICKER_NAMES.get(ticker, ticker),
-    )
+    if ticker in TICKER_NAMES:
+        return TICKER_NAMES[ticker]
+
+    if ticker in DEFAULT_TICKER_NAMES:
+        return DEFAULT_TICKER_NAMES[ticker]
+
+    # AUDIT FIX: unknown tickers used to fall back to the bare symbol, which
+    # made the company-news search ("AAPL" AAPL ...) far less precise.
+    try:
+        info = yf.Ticker(ticker).info or {}
+        name = info.get("longName") or info.get("shortName")
+        if name:
+            return str(name).strip()
+    except Exception as e:
+        print(f"Name lookup failed for {ticker}: {e}")
+
+    return ticker
+
+
+def parse_published(value):
+    """Parse a news timestamp (ISO 8601 or RFC 2822) into an aware datetime."""
+
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+
+    return dt
+
+
+def is_recent(published, cutoff):
+    """True when a timestamp is on or after the cutoff (undated → False)."""
+
+    return published is not None and published >= cutoff
+
+
+def news_cutoff(hours_before_prev_close=0):
+    """Earliest publish time accepted for 'today' news."""
+
+    return previous_close_dt() - timedelta(hours=hours_before_prev_close)
+
+
+def search_days():
+    """Tavily 'days' window that covers back to the previous session close."""
+
+    return max(1, (market_today() - previous_close_dt().date()).days + 1)
 
 
 def news_publisher(result):
@@ -387,8 +602,17 @@ def news_publisher(result):
 
 # News and market-group helpers
 
-def get_headlines(ticker, limit=5):
-    """Return deduplicated Yahoo Finance headlines for a ticker."""
+def get_headlines(ticker, limit=5, cutoff=None):
+    """
+    Return deduplicated Yahoo Finance headlines for a ticker, newest first.
+
+    AUDIT FIX: Yahoo's feed mixes in stories that are days old, which is why
+    ticker summaries described the prior day. Only stories published since
+    `cutoff` (default: the previous session's close) are kept.
+    """
+
+    if cutoff is None:
+        cutoff = news_cutoff()
 
     try:
         news = (
@@ -420,6 +644,22 @@ def get_headlines(ticker, limit=5):
             continue
 
         title = title.strip()
+
+        published = parse_published(
+            content.get("pubDate")
+            or content.get("displayTime")
+            or article.get("providerPublishTime")
+        )
+
+        if published is None and isinstance(
+            article.get("providerPublishTime"), (int, float)
+        ):
+            published = datetime.fromtimestamp(
+                article["providerPublishTime"], pytz.utc
+            )
+
+        if not is_recent(published, cutoff):
+            continue
 
         normalized_title = (
             title.lower()
@@ -465,34 +705,45 @@ def get_headlines(ticker, limit=5):
                 "title": title,
                 "publisher": publisher,
                 "url": url,
+                "published": published,
             }
         )
 
-        if len(out) >= limit:
-            break
+    out.sort(key=lambda h: h["published"], reverse=True)
 
-    return out
-
+    return out[:limit]
 
 
-def gather_group(tickers, with_headlines=False, headline_limit=5):
+
+def gather_group(
+    tickers,
+    with_headlines=False,
+    headline_limit=5,
+    with_after_hours=False,
+):
     rows = []
 
     for ticker in tickers:
-        current, daily, ytd = get_quote_and_ytd(ticker)
+        quote = get_quote(ticker)
 
-        if current is None:
-            print(f"Skipping {ticker}: no quote data available")
+        if quote is None:
+            audit(f"{ticker}: no quote data available; row omitted.")
             continue
 
         row = {
             "ticker": ticker,
             "name": company_name(ticker),
-            "price": current,
-            "daily": daily,
-            "ytd": ytd,
+            "price": quote["price"],
+            "daily": quote["daily"],
+            "ytd": quote["ytd"],
+            "as_of": quote["as_of"],
+            "stale": quote["stale"],
+            "after_hours": None,
             "headlines": [],
         }
+
+        if with_after_hours:
+            row["after_hours"] = get_after_hours(ticker)
 
         if with_headlines:
             yahoo_headlines = get_headlines(ticker, limit=headline_limit)
@@ -511,36 +762,14 @@ def gather_group(tickers, with_headlines=False, headline_limit=5):
                     seen_titles.add(key)
                     combined.append(headline)
 
-                if len(combined) >= headline_limit:
-                    break
+            # Newest first so the model leads with today's catalyst.
+            combined.sort(
+                key=lambda h: h.get("published")
+                or datetime.min.replace(tzinfo=pytz.utc),
+                reverse=True,
+            )
 
-            row["headlines"] = combined
-
-        rows.append(row)
-
-    return rows
-
-    # Supplement Yahoo's feed when it returns too little coverage.
-    if len(row["headlines"]) < headline_limit:
-        extra = search_company_news(
-            ticker,
-            limit=headline_limit,
-        )
-
-        seen_titles = {
-            h["title"].strip().lower()
-            for h in row["headlines"]
-        }
-
-        for headline in extra:
-            key = headline["title"].strip().lower()
-
-            if key not in seen_titles:
-                row["headlines"].append(headline)
-                seen_titles.add(key)
-
-            if len(row["headlines"]) >= headline_limit:
-                break
+            row["headlines"] = combined[:headline_limit]
 
         rows.append(row)
 
@@ -573,7 +802,8 @@ def gather_market_news(limit=10):
         )
         return []
 
-    today = market_today()
+    today = session_date()
+    cutoff = news_cutoff()
 
     queries = [
         (
@@ -597,11 +827,16 @@ def gather_market_news(limit=10):
         ),
     ]
 
-    results = []
+    per_query = []
+    undated = []
     seen_urls = set()
     seen_titles = set()
+    dropped_old = 0
 
     for query in queries:
+
+        results = []
+        per_query.append(results)
 
         try:
 
@@ -616,7 +851,7 @@ def gather_market_news(limit=10):
                     "query": query,
                     "search_depth": "advanced",
                     "topic": "news",
-                    "days": 2,
+                    "days": search_days(),
                     "max_results": limit,
                     "include_answer": False,
                 },
@@ -674,6 +909,16 @@ def gather_market_news(limit=10):
             if not title or not url:
                 continue
 
+            # AUDIT FIX: Tavily's "days" window is coarse; drop anything
+            # published before the previous session's close.
+            published = parse_published(
+                result.get("published_date")
+            )
+
+            if published is not None and published < cutoff:
+                dropped_old += 1
+                continue
+
             title_key = (
                 title.lower()
             )
@@ -687,18 +932,42 @@ def gather_market_news(limit=10):
             seen_urls.add(url)
             seen_titles.add(title_key)
 
-            results.append(
+            # Undated results are only used if dated coverage is thin.
+            (results if published else undated).append(
                 {
                     "title": title,
                     "publisher": news_publisher(result),
                     "url": url,
                     "snippet": content,
+                    "published": published,
                 }
             )
 
-    # Keep the strongest first results while preventing one query
-    # from dominating the entire list.
+    # AUDIT FIX: the old code took the first `limit` results overall, so the
+    # first query filled the whole list (the opposite of the comment's
+    # intent). Interleave the queries round-robin instead.
+    results = []
+    depth = max((len(r) for r in per_query), default=0)
+
+    for i in range(depth):
+        for query_results in per_query:
+            if i < len(query_results):
+                results.append(query_results[i])
+
+    if len(results) < 3 and undated:
+        audit(
+            f"Only {len(results)} dated market-news results since the "
+            f"previous close; added {min(len(undated), limit)} undated results."
+        )
+        results.extend(undated)
+
     results = results[:limit]
+
+    if dropped_old:
+        print(
+            f"Dropped {dropped_old} market-news results published "
+            f"before the previous close"
+        )
 
     print(
         "Total market news results collected: "
@@ -718,8 +987,18 @@ def gather_market_news(limit=10):
 
     return results
 
-def search_company_news(ticker, limit=5):
-    """Search broadly for company-specific news using Tavily."""
+def search_company_news(ticker, limit=5, name=None, topic="stock news", cutoff=None):
+    """
+    Search broadly for company-specific news using Tavily.
+
+    AUDIT FIX: the search window was 7 days with no date filter, so
+    summaries regularly described last week's or yesterday's news as
+    today's catalyst. Results are now limited to stories published since the
+    previous session's close and carry their publish time into the prompt.
+    """
+
+    if cutoff is None:
+        cutoff = news_cutoff()
 
     api_key = getattr(
         config,
@@ -730,7 +1009,7 @@ def search_company_news(ticker, limit=5):
     if not api_key:
         return []
 
-    name = company_name(ticker)
+    name = name or company_name(ticker)
 
     try:
         response = requests.post(
@@ -741,11 +1020,12 @@ def search_company_news(ticker, limit=5):
             json={
                 "api_key": api_key,
                 "query": (
-                    f'"{name}" {ticker} company stock news'
+                    f'"{name}" {ticker} {topic} '
+                    f'{session_date().strftime("%B %d, %Y")}'
                 ),
                 "topic": "news",
                 "search_depth": "advanced",
-                "days": 7,
+                "days": search_days(),
                 "max_results": limit,
                 "include_answer": False,
             },
@@ -786,6 +1066,13 @@ def search_company_news(ticker, limit=5):
         if not title or not url:
             continue
 
+        published = parse_published(
+            result.get("published_date")
+        )
+
+        if not is_recent(published, cutoff):
+            continue
+
         key = title.lower()
 
         if key in seen:
@@ -800,41 +1087,56 @@ def search_company_news(ticker, limit=5):
             "snippet": str(
                 result.get("content", "") or ""
             ).strip(),
+            "published": published,
         })
 
     return headlines
 
-def gather_labeled_etfs(mapping):
-    """Gather performance for sector and factor ETF proxies."""
+
+def gather_labeled_etfs(mapping, benchmark=None):
+    """
+    Gather performance for sector and factor ETF proxies.
+
+    When a benchmark is given, each row also carries its daily and YTD
+    return relative to that benchmark (simple difference in % points).
+    """
+
+    bench = get_quote(benchmark) if benchmark else None
 
     rows = []
 
     for label, ticker in mapping.items():
 
-        current, daily, ytd = (
-            get_quote_and_ytd(
-                ticker
-            )
-        )
+        quote = get_quote(ticker)
 
-        if current is None:
-            print(
+        if quote is None:
+            audit(
                 f"Could not fetch ETF data "
                 f"for {label} ({ticker})"
             )
             continue
 
-        rows.append(
-            {
-                "label": label,
-                "ticker": ticker,
-                "price": current,
-                "daily": daily,
-                "ytd": ytd,
-            }
-        )
+        row = {
+            "label": label,
+            "ticker": ticker,
+            "price": quote["price"],
+            "daily": quote["daily"],
+            "ytd": quote["ytd"],
+            "stale": quote["stale"],
+            "rel_daily": None,
+            "rel_ytd": None,
+        }
+
+        if bench:
+            if row["daily"] is not None and bench["daily"] is not None:
+                row["rel_daily"] = row["daily"] - bench["daily"]
+            if row["ytd"] is not None and bench["ytd"] is not None:
+                row["rel_ytd"] = row["ytd"] - bench["ytd"]
+
+        rows.append(row)
 
     return rows
+
 
 # Portfolio calculations
 
@@ -860,6 +1162,8 @@ def calculate_weighted_portfolio_return(
         value = row.get(field)
         weight = weights.get(ticker)
 
+        # Stale rows have daily=None and are excluded; see
+        # portfolio_weight_coverage() for how much weight that leaves out.
         if value is None:
             continue
 
@@ -881,7 +1185,102 @@ def calculate_weighted_portfolio_return(
     )
 
 
-# FRED macro data
+def portfolio_weight_coverage(rows, field, weights):
+    """
+    Share of total portfolio weight that has a usable value for `field`.
+
+    AUDIT: the weighted return renormalises over the holdings that have data.
+    Without this check a missing or stale holding silently changes the
+    portfolio's composition for the day.
+    """
+
+    total = sum(w for w in weights.values() if w)
+
+    if not total:
+        return None
+
+    covered = sum(
+        weights.get(r["ticker"]) or 0
+        for r in rows
+        if r.get(field) is not None
+    )
+
+    return covered / total
+
+
+# Treasury / FRED macro data
+
+def get_treasury_curve(columns):
+    """
+    Pull the two latest observations for each requested tenor from the U.S.
+    Treasury's official daily par yield curve.
+
+    AUDIT FIX: FRED's DGS series are republished the following business day,
+    so at a post-close run FRED's "latest" value is usually YESTERDAY's yield
+    and the bps change is the prior day's change. Treasury publishes the
+    same-day curve in the late afternoon; FRED is kept only as a fallback.
+
+    Returns {column: (previous, latest)} with each item {"date", "value"}.
+    """
+
+    session = session_date()
+    observations = []
+
+    for year in (session.year, session.year - 1):
+
+        url = (
+            "https://home.treasury.gov/resource-center/data-chart-center/"
+            f"interest-rates/daily-treasury-rates.csv/{year}/all"
+            f"?type=daily_treasury_yield_curve&field_tdr_date_value={year}"
+            "&page&_format=csv"
+        )
+
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Treasury yield curve {year} failed: {e}")
+            continue
+
+        for row in csv.DictReader(io.StringIO(response.text)):
+            try:
+                obs_date = datetime.strptime(
+                    row.get("Date", ""), "%m/%d/%Y"
+                ).date()
+            except ValueError:
+                continue
+
+            if obs_date > session:
+                continue
+
+            observations.append((obs_date, row))
+
+        # Two observations from the current year are enough.
+        if len(observations) >= 2:
+            break
+
+    observations.sort(key=lambda x: x[0])
+
+    out = {}
+
+    for column in columns:
+        values = []
+
+        for obs_date, row in observations:
+            raw = (row.get(column) or "").strip()
+            try:
+                values.append(
+                    {"date": obs_date.isoformat(), "value": float(raw)}
+                )
+            except ValueError:
+                continue
+
+        if len(values) >= 2:
+            out[column] = (values[-2], values[-1])
+
+    return out
+
+
 
 def get_fred_series(series_id):
     """Pull the two latest valid observations from FRED's public CSV endpoint."""
@@ -962,20 +1361,31 @@ def gather_macro_data():
     # Treasury rates
 
     treasury_series = {
-        "2Y Treasury": "DGS2",
-        "10Y Treasury": "DGS10",
-        "30Y Treasury": "DGS30",
+        # label: (Treasury CSV column, FRED fallback series)
+        "2Y Treasury": ("2 Yr", "DGS2"),
+        "10Y Treasury": ("10 Yr", "DGS10"),
+        "30Y Treasury": ("30 Yr", "DGS30"),
     }
 
-    for label, series_id in (
+    curve = get_treasury_curve(
+        [column for column, _ in treasury_series.values()]
+    )
+
+    for label, (column, series_id) in (
         treasury_series.items()
     ):
 
-        result = get_fred_series(
-            series_id
-        )
+        result = curve.get(column)
+        source = "U.S. Treasury"
 
         if not result:
+            result = get_fred_series(
+                series_id
+            )
+            source = "FRED"
+
+        if not result:
+            audit(f"{label}: no yield data from Treasury or FRED.")
             continue
 
         previous, latest = result
@@ -985,21 +1395,33 @@ def gather_macro_data():
             - previous["value"]
         ) * 100
 
+        if latest["date"] != session_date().isoformat():
+            audit(
+                f"{label}: latest yield ({source}) is dated "
+                f"{latest['date']}, not {session_date().isoformat()}; the "
+                "change shown is for that date."
+            )
+
         data["rates"].append(
             {
                 "label": label,
                 "value": latest["value"],
                 "daily_bps": change_bps,
                 "as_of": latest["date"],
+                "source": source,
             }
         )
 
     # Cross-asset markets
 
+    # AUDIT FIX: Brent (BZ=F) replaces WTI (CL=F) as the global benchmark.
+    # USD/CAD is added because several holdings are CAD-denominated and the
+    # currency explains most of their gap vs USD benchmarks.
     cross_asset_map = {
         "DXY": "DX-Y.NYB",
+        "USD/CAD": "CAD=X",
         "Gold": "GC=F",
-        "WTI Crude": "CL=F",
+        "Brent Crude": "BZ=F",
         "VIX": "^VIX",
     }
 
@@ -1007,26 +1429,244 @@ def gather_macro_data():
         cross_asset_map.items()
     ):
 
-        current, daily, ytd = (
-            get_quote_and_ytd(
-                ticker
-            )
-        )
+        quote = get_quote(ticker)
 
-        if current is None:
+        if quote is None:
+            audit(f"{label} ({ticker}): no quote data available.")
             continue
 
         data["cross_asset"].append(
             {
                 "label": label,
                 "ticker": ticker,
-                "value": current,
-                "daily": daily,
-                "ytd": ytd,
+                "value": quote["price"],
+                "daily": quote["daily"],
+                "ytd": quote["ytd"],
             }
         )
 
     return data
+
+
+# Earnings: recent reporters and the market-wide calendar
+
+NASDAQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+def parse_money(value):
+    """'$1,234.5' / '($0.12)' → float, or None."""
+
+    if value in (None, "", "N/A", "--"):
+        return None
+
+    text = str(value).strip()
+    negative = text.startswith("(") or text.startswith("-")
+    text = re.sub(r"[^0-9.]", "", text)
+
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+
+    return -number if negative else number
+
+
+@lru_cache(maxsize=None)
+def fetch_earnings_calendar(day):
+    """
+    Return the market-wide earnings calendar for one date from Nasdaq.
+
+    AUDIT FIX: earnings used to come only from yfinance calendars for the
+    tracked tickers. This covers every US-listed reporter, so the most
+    market-moving reports appear whether or not they are tracked.
+    """
+
+    url = (
+        "https://api.nasdaq.com/api/calendar/earnings"
+        f"?date={day.isoformat()}"
+    )
+
+    try:
+        response = requests.get(url, headers=NASDAQ_HEADERS, timeout=20)
+        response.raise_for_status()
+        rows = (response.json().get("data") or {}).get("rows") or []
+    except Exception as e:
+        print(f"Earnings calendar failed for {day}: {e}")
+        return ()
+
+    timing = {
+        "time-pre-market": "Before open",
+        "time-after-hours": "After close",
+    }
+
+    out = []
+    seen_names = set()
+
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip()
+        name = str(row.get("name") or "").strip()
+
+        if not symbol:
+            continue
+
+        # Collapse share classes (GOOG/GOOGL) into one entry.
+        name_key = name.lower()
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+
+        out.append({
+            "ticker": symbol,
+            "name": name or symbol,
+            "date": day.isoformat(),
+            "time": timing.get(row.get("time"), "Time n/a"),
+            "market_cap": parse_money(row.get("marketCap")),
+            "eps_forecast": parse_money(row.get("epsForecast")),
+            "eps_actual": parse_money(row.get("eps")),
+            "surprise_pct": parse_money(row.get("surprise")),
+        })
+
+    return tuple(out)
+
+
+def resolve_report_time(ticker, day):
+    """
+    Fill in report timing when Nasdaq does not supply it, using the
+    timestamp on yfinance's earnings dates (16:00 ET = after the close).
+    """
+
+    try:
+        dates = yf.Ticker(ticker).get_earnings_dates(limit=8)
+    except Exception as e:
+        print(f"Earnings timing lookup failed for {ticker}: {e}")
+        return "Time n/a"
+
+    if dates is None or dates.empty:
+        return "Time n/a"
+
+    for ts in dates.index:
+        local = ts.tz_convert(MARKET_TZ) if ts.tzinfo else ts
+
+        if local.date() != day:
+            continue
+
+        if local.hour >= 16:
+            return "After close"
+
+        if (local.hour, local.minute) < (9, 30):
+            return "Before open"
+
+    return "Time n/a"
+
+
+def tracked_universe():
+    return set(
+        list(getattr(config, "TICKERS", []))
+        + list(getattr(config, "PORTFOLIO", []))
+    )
+
+
+def gather_recent_earnings():
+    """
+    Impactful earnings released since the previous close, with the market's
+    reaction:
+
+    - previous session after the close, or today before the open
+      → reaction is today's regular-session return;
+    - today after the close → reaction is the after-hours move;
+    - today, time not supplied → both are shown.
+    """
+
+    session = session_date()
+    prev = SESSION["prev_date"] or (session - timedelta(days=1))
+    tracked = tracked_universe()
+
+    def impactful(entry):
+        return (
+            entry["ticker"] in tracked
+            or (entry["market_cap"] or 0) >= RECENT_EARNINGS_MIN_MARKET_CAP
+        )
+
+    candidates = []
+
+    for entry in fetch_earnings_calendar(prev):
+        if not impactful(entry):
+            continue
+
+        timing = entry["time"]
+        if timing == "Time n/a":
+            timing = resolve_report_time(entry["ticker"], prev)
+
+        # Only previous-day reports released after the close are new to
+        # today's session; earlier ones were already priced yesterday.
+        if timing == "After close":
+            candidates.append(dict(entry, time=timing, window="prev_after"))
+
+    for entry in fetch_earnings_calendar(session):
+        if not impactful(entry):
+            continue
+
+        timing = entry["time"]
+        if timing == "Time n/a":
+            timing = resolve_report_time(entry["ticker"], session)
+
+        candidates.append(dict(entry, time=timing, window="today"))
+
+    candidates.sort(
+        key=lambda c: (c["ticker"] not in tracked, -(c["market_cap"] or 0))
+    )
+
+    results = []
+
+    for c in candidates[:MAX_RECENT_EARNINGS]:
+
+        quote = get_quote(c["ticker"])
+        after_hours = get_after_hours(c["ticker"])
+
+        session_move = quote["daily"] if quote else None
+        ah_move = after_hours["pct"] if after_hours else None
+
+        if c["window"] == "prev_after" or c["time"] == "Before open":
+            reaction = session_move
+            reaction_basis = "today's session"
+        elif c["time"] == "After close":
+            reaction = ah_move
+            reaction_basis = "after hours"
+        else:
+            reaction = ah_move if ah_move is not None else session_move
+            reaction_basis = (
+                "after hours" if ah_move is not None else "today's session"
+            )
+
+        headlines = search_company_news(
+            c["ticker"],
+            limit=3,
+            name=c["name"],
+            topic="earnings results guidance",
+        )
+
+        results.append(dict(
+            c,
+            reported=(
+                f"{prev.isoformat()} after close"
+                if c["window"] == "prev_after"
+                else f"{session.isoformat()} {c['time'].lower()}"
+            ),
+            session_move=session_move,
+            after_hours=ah_move,
+            reaction=reaction,
+            reaction_basis=reaction_basis,
+            headlines=headlines,
+        ))
+
+    return results
 
 
 # Looking ahead: earnings and macro headlines
@@ -1166,23 +1806,40 @@ def gather_lookahead():
         "macro": [],
     }
 
-    today = market_today()
+    today = session_date()
 
     horizon = (
         today
-        + timedelta(days=7)
+        + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)
     )
 
     # Earnings
 
-    tracked_for_earnings = list(
-        dict.fromkeys(
-            config.TICKERS
-            + config.PORTFOLIO
-        )
-    )
+    # Market-wide calendar, screened by market cap so that the biggest
+    # upcoming reports appear even when they are not tracked.
+    tracked = tracked_universe()
+    seen = set()
 
-    for ticker in tracked_for_earnings:
+    day = today + timedelta(days=1)
+
+    while day <= horizon:
+
+        if day.weekday() < 5:
+            for entry in fetch_earnings_calendar(day):
+                if (
+                    entry["ticker"] in tracked
+                    or (entry["market_cap"] or 0)
+                    >= UPCOMING_EARNINGS_MIN_MARKET_CAP
+                ):
+                    lookahead["earnings"].append(
+                        dict(entry, tracked=entry["ticker"] in tracked)
+                    )
+                    seen.add(entry["ticker"])
+
+        day += timedelta(days=1)
+
+    # Tracked non-US listings (e.g. EL.PA) are not on the Nasdaq calendar.
+    for ticker in sorted(tracked - seen):
 
         try:
 
@@ -1204,7 +1861,7 @@ def gather_lookahead():
 
                 if (
                     today
-                    <= earnings_date
+                    < earnings_date
                     <= horizon
                 ):
 
@@ -1212,14 +1869,13 @@ def gather_lookahead():
                         "earnings"
                     ].append(
                         {
-                            "ticker":
-                                ticker,
-                            "name":
-                                company_name(
-                                    ticker
-                                ),
-                            "date":
-                                earnings_date.isoformat(),
+                            "ticker": ticker,
+                            "name": company_name(ticker),
+                            "date": earnings_date.isoformat(),
+                            "time": "Time n/a",
+                            "market_cap": None,
+                            "eps_forecast": None,
+                            "tracked": True,
                         }
                     )
 
@@ -1230,6 +1886,15 @@ def gather_lookahead():
                 f"Calendar check failed "
                 f"for {ticker}: {e}"
             )
+
+    # Tracked names first, then by size; keep the list readable.
+    lookahead["earnings"].sort(
+        key=lambda e: (not e["tracked"], -(e["market_cap"] or 0))
+    )
+    lookahead["earnings"] = sorted(
+        lookahead["earnings"][:MAX_UPCOMING_EARNINGS],
+        key=lambda e: (e["date"], -(e["market_cap"] or 0)),
+    )
 
     # Macro headlines
 
@@ -1447,6 +2112,32 @@ def _groq_call(
 
 # AI analysis
 
+def fmt_signed(value, suffix="%", digits=2):
+    """Prompt/HTML-safe signed number; None → 'n/a'."""
+
+    if value is None:
+        return "n/a"
+
+    return f"{value:+.{digits}f}{suffix}"
+
+
+def fmt_published(published):
+    if not published:
+        return "time n/a"
+
+    return published.astimezone(MARKET_TZ).strftime("%b %d %I:%M %p ET")
+
+
+def fmt_market_cap(value):
+    if not value:
+        return "n/a"
+
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+
+    return f"${value / 1e9:.0f}B"
+
+
 def build_ai_summary(
     indices,
     sectors,
@@ -1456,45 +2147,72 @@ def build_ai_summary(
     macro,
     market_news,
     lookahead,
+    recent_earnings,
 ):
 
     # Prompt formatting helpers
 
+    def fmt_quote(r, label=None):
+        line = (
+            f"{label or r['ticker']} "
+            f"({r.get('name') or r['ticker']}) | "
+            f"daily {fmt_signed(r['daily'])} | "
+            f"YTD {fmt_signed(r['ytd'])}"
+        )
+
+        if r.get("stale"):
+            line += (
+                f" | STALE: no bar for {session_date()}, last close "
+                f"{r.get('as_of')}; do NOT describe a move for today"
+            )
+
+        return line
+
     def fmt_indices(rows):
 
         return "\n".join(
-            f"{r['ticker']} "
-            f"({r['name']}) | "
-            f"daily "
-            f"{r['daily']:+.2f}% | "
-            f"YTD "
-            f"{r['ytd']:+.2f}%"
-            for r in rows
+            fmt_quote(r) for r in rows
         )
 
-    def fmt_sectors(rows):
+    def fmt_labeled(rows):
 
         return "\n".join(
             f"{r['label']} "
             f"({r['ticker']}) | "
-            f"daily "
-            f"{r['daily']:+.2f}% | "
-            f"YTD "
-            f"{r['ytd']:+.2f}%"
+            f"daily {fmt_signed(r['daily'])} | "
+            f"YTD {fmt_signed(r['ytd'])}"
+            + (
+                f" | vs {FACTOR_BENCHMARK} daily "
+                f"{fmt_signed(r['rel_daily'], ' pp')}, YTD "
+                f"{fmt_signed(r['rel_ytd'], ' pp')}"
+                if r.get("rel_daily") is not None
+                else ""
+            )
             for r in rows
         )
 
-    def fmt_factors(rows):
+    def fmt_headline_list(headlines, indent="  "):
 
-        return "\n".join(
-            f"{r['label']} "
-            f"({r['ticker']}) | "
-            f"daily "
-            f"{r['daily']:+.2f}% | "
-            f"YTD "
-            f"{r['ytd']:+.2f}%"
-            for r in rows
-        )
+        lines = []
+
+        for i, headline in enumerate(
+            headlines,
+            start=1,
+        ):
+
+            lines.append(
+                f"{indent}[{i}] "
+                f"({fmt_published(headline.get('published'))}) "
+                f"{headline['title']} "
+                f"— {headline['publisher']}"
+            )
+
+            if headline.get("snippet"):
+                lines.append(
+                    f"{indent}    {headline['snippet'][:400]}"
+                )
+
+        return lines
 
     def fmt_tickers(rows):
 
@@ -1502,33 +2220,28 @@ def build_ai_summary(
 
         for r in rows:
 
-            lines.append(
-                f"\n{r['ticker']} "
-                f"({r['name']}) | "
-                f"daily "
-                f"{r['daily']:+.2f}% | "
-                f"YTD "
-                f"{r['ytd']:+.2f}%"
-            )
+            line = "\n" + fmt_quote(r)
+
+            if r.get("after_hours"):
+                line += (
+                    f" | after hours "
+                    f"{fmt_signed(r['after_hours']['pct'])} "
+                    f"as of {r['after_hours']['time']}"
+                )
+
+            lines.append(line)
 
             if r["headlines"]:
 
-                for i, headline in enumerate(
-                    r["headlines"],
-                    start=1,
-                ):
-
-                    lines.append(
-                        f"  [{i}] "
-                        f"{headline['title']} "
-                        f"— {headline['publisher']}"
-                    )
+                lines.extend(
+                    fmt_headline_list(r["headlines"])
+                )
 
             else:
 
                 lines.append(
-                    "  (no company-specific "
-                    "headlines available)"
+                    "  (no company-specific headlines "
+                    "published since the previous close)"
                 )
 
         return "\n".join(lines)
@@ -1536,13 +2249,7 @@ def build_ai_summary(
     def fmt_portfolio(rows):
 
         return "\n".join(
-            f"{r['ticker']} "
-            f"({r['name']}) | "
-            f"daily "
-            f"{r['daily']:+.2f}% | "
-            f"YTD "
-            f"{r['ytd']:+.2f}%"
-            for r in rows
+            fmt_quote(r) for r in rows
         )
 
     def fmt_macro(macro_data):
@@ -1586,10 +2293,8 @@ def build_ai_summary(
                     f"{r['label']} | "
                     f"value "
                     f"{r['value']:.2f} | "
-                    f"daily "
-                    f"{r['daily']:+.2f}% | "
-                    f"YTD "
-                    f"{r['ytd']:+.2f}%"
+                    f"daily {fmt_signed(r['daily'])} | "
+                    f"YTD {fmt_signed(r['ytd'])}"
                 )
 
         if not lines:
@@ -1617,7 +2322,8 @@ def build_ai_summary(
 
             lines.append(
                 f"    Publisher: "
-                f"{h['publisher']}"
+                f"{h['publisher']} | "
+                f"Published: {fmt_published(h.get('published'))}"
             )
 
             if h.get("snippet"):
@@ -1636,6 +2342,31 @@ def build_ai_summary(
 
         return "\n".join(lines)
 
+    def fmt_recent_earnings(rows):
+
+        if not rows:
+            return "(no impactful earnings since the previous close)"
+
+        lines = []
+
+        for r in rows:
+
+            lines.append(
+                f"\n{r['ticker']} ({r['name']}) | reported {r['reported']} | "
+                f"mkt cap {fmt_market_cap(r['market_cap'])} | "
+                f"EPS {r['eps_actual'] if r['eps_actual'] is not None else 'n/a'}"
+                f" vs est {r['eps_forecast'] if r['eps_forecast'] is not None else 'n/a'}"
+                f" (surprise {fmt_signed(r['surprise_pct'])}) | "
+                f"session {fmt_signed(r['session_move'])} | "
+                f"after hours {fmt_signed(r['after_hours'])}"
+            )
+
+            lines.extend(
+                fmt_headline_list(r["headlines"])
+                or ["  (no earnings coverage found)"]
+            )
+
+        return "\n".join(lines)
 
     def fmt_lookahead(lookahead_data):
 
@@ -1646,20 +2377,21 @@ def build_ai_summary(
         ]:
 
             lines.append(
-                "UPCOMING EARNINGS"
+                "UPCOMING EARNINGS (market-wide, screened by size; "
+                "TRACKED = in the user's watchlist/portfolio)"
             )
 
-            for earnings in sorted(
-                lookahead_data[
-                    "earnings"
-                ],
-                key=lambda x: x["date"],
+            for earnings in (
+                lookahead_data["earnings"]
             ):
 
                 lines.append(
-                    f"{earnings['date']}: "
+                    f"{earnings['date']} {earnings['time']}: "
                     f"{earnings['ticker']} "
-                    f"({earnings['name']})"
+                    f"({earnings['name']}) | "
+                    f"mkt cap {fmt_market_cap(earnings['market_cap'])} | "
+                    f"EPS est {earnings['eps_forecast'] if earnings['eps_forecast'] is not None else 'n/a'}"
+                    + (" | TRACKED" if earnings.get("tracked") else "")
                 )
 
         if lookahead_data[
@@ -1685,6 +2417,7 @@ def build_ai_summary(
             return "(no lookahead data)"
 
         return "\n".join(lines)
+
     portfolio_daily = (
         calculate_weighted_portfolio_return(
             portfolio,
@@ -1723,11 +2456,19 @@ def build_ai_summary(
     # Groq prompt
 
     prompt = f"""
-You are writing a professional daily investment review for someone
+You are writing a professional Daily Market Review for someone
 building experience for a career in wealth management and asset management.
 
 The report should resemble a concise internal investment note:
 data first, analysis second, implications third.
+
+SESSION DATE: {session_date().strftime('%A, %B %d, %Y')}
+PREVIOUS CLOSE: {previous_close_dt().strftime('%A, %B %d, %Y %I:%M %p ET')}
+
+All returns below are close-to-close for the session date, measured
+against the dividend/split-adjusted previous close. YTD is measured from
+the prior year's final close. Headlines carry their publish time; only
+material published since the previous close has been supplied.
 
 Respond with ONE JSON OBJECT ONLY.
 Do not include markdown outside the JSON.
@@ -1740,10 +2481,10 @@ INDICES:
 {fmt_indices(indices)}
 
 SECTORS:
-{fmt_sectors(sectors)}
+{fmt_labeled(sectors)}
 
-FACTORS / STYLE:
-{fmt_factors(factors)}
+FACTORS / STYLE (pp = percentage points vs {FACTOR_BENCHMARK}):
+{fmt_labeled(factors)}
 
 TRACKED TICKERS:
 {fmt_tickers(tickers)}
@@ -1758,6 +2499,12 @@ MACRO / CROSS-ASSET
 ==================================================
 
 {fmt_macro(macro)}
+
+==================================================
+RECENT EARNINGS (since the previous close)
+==================================================
+
+{fmt_recent_earnings(recent_earnings)}
 
 ==================================================
 MARKET HEADLINES
@@ -1797,6 +2544,11 @@ REQUIRED JSON
       "summary": "<roughly 180-250 words>",
       "source_index": 1
     }}
+  ],
+
+  "earnings_recap": [
+    "<one bullet per material report: result vs expectations, guidance,
+      and the price reaction supplied above>"
   ],
 
   "investment_implications": {{
@@ -1844,8 +2596,25 @@ TICKER REVIEW
   that the move remains unexplained by the sources reviewed.
 - Do not infer a cause from the price movement alone.
 - Distinguish confirmed catalysts from plausible but unverified
-  explanations.- Do not fabricate company events, facts or sources.
+  explanations.
+- Do not fabricate company events, facts or sources.
 - Do not spend the entire note repeating the daily percentage move.
+- Use ONLY the daily, YTD and after-hours figures supplied above. Never
+  compute, round differently or recall a return from memory.
+- Describe events from the supplied headlines as TODAY's news only if
+  their publish time is on or after the previous close.
+- If a row is marked STALE, say its market did not trade / data is not
+  yet available, and do not describe a daily move.
+- If an after-hours move is supplied and material (roughly 2% or more),
+  mention it and its catalyst if one is visible in the headlines.
+
+EARNINGS RECAP
+- Cover the most market-relevant reports from RECENT EARNINGS, largest
+  or most market-moving first; 3-6 bullets.
+- State the EPS result vs estimate, any guidance visible in the
+  headlines, and the price reaction (session or after hours as supplied).
+- If no coverage explains the reaction, say so. Return an empty list if
+  there are no recent earnings.
 
 MARKET STORIES
 - Select 3-5 of the most important DISTINCT stories from the supplied
@@ -1885,7 +2654,9 @@ INVESTMENT IMPLICATIONS
 - These should be analytical rather than repetitive.
 
 LOOKING AHEAD
-- Mention specific upcoming tracked-company earnings where available.
+- Highlight the most market-moving upcoming earnings from the
+  market-wide calendar (mega-caps and sector bellwethers), and call out
+  any marked TRACKED.
 - Mention specific macro developments only when visible in the
   supplied lookahead data.
 - Explain what matters and why, rather than providing only a calendar.
@@ -1900,7 +2671,7 @@ BOTTOM LINE
 
     parsed = _groq_call(
         prompt,
-        max_tokens=6500,
+        max_tokens=8000,
         temperature=0.3,
     )
 
@@ -1910,6 +2681,7 @@ BOTTOM LINE
             "executive_summary": [],
             "tickers": {},
             "stories": [],
+            "earnings_recap": [],
             "investment_implications": {
                 "bull_case": [],
                 "bear_case": [],
@@ -2119,6 +2891,25 @@ BOTTOM LINE
         ).strip(),
     }
 
+    # Normalize earnings recap
+
+    earnings_recap = (
+        parsed.get("earnings_recap")
+        or []
+    )
+
+    if not isinstance(
+        earnings_recap,
+        list,
+    ):
+        earnings_recap = []
+
+    earnings_recap = [
+        str(item).strip()
+        for item in earnings_recap
+        if str(item).strip()
+    ][:6]
+
     # Normalize forward view
 
     looking_ahead = str(
@@ -2147,6 +2938,9 @@ BOTTOM LINE
         "stories":
             stories,
 
+        "earnings_recap":
+            earnings_recap,
+
         "investment_implications":
             investment_implications,
 
@@ -2168,6 +2962,9 @@ def html_escape(value):
 
 
 def pct_class(value):
+    if value is None:
+        return "neutral"
+
     if value > 0:
         return "positive"
 
@@ -2177,13 +2974,25 @@ def pct_class(value):
     return "neutral"
 
 
-def format_pct(value):
-    return f"{value:+.2f}%"
+def format_pct(value, suffix="%"):
+    if value is None:
+        return "n/a"
+
+    return f"{value:+.2f}{suffix}"
+
+
+def pct_cell(value, suffix="%"):
+    return (
+        f"<td class=\"number {pct_class(value)}\">"
+        f"{format_pct(value, suffix)}"
+        f"</td>"
+    )
 
 
 def build_quote_table(
     rows,
     include_price=False,
+    include_after_hours=False,
 ):
     """Build HTML tables for indices, tickers, and portfolio holdings."""
 
@@ -2210,6 +3019,14 @@ def build_quote_table(
 
     html.append(
         "<th>Daily</th>"
+    )
+
+    if include_after_hours:
+        html.append(
+            "<th>After Hours</th>"
+        )
+
+    html.append(
         "<th>YTD</th>"
         "</tr>"
         "</thead>"
@@ -2221,8 +3038,13 @@ def build_quote_table(
 
     for row in rows:
 
-        daily = row["daily"]
-        ytd = row["ytd"]
+        name = html_escape(row["name"])
+
+        if row.get("stale"):
+            name += (
+                f' <span class="flag">(no {session_date():%b %d} '
+                f'session data; last close {row.get("as_of")})</span>'
+            )
 
         html.append(
             "<tr>"
@@ -2236,7 +3058,7 @@ def build_quote_table(
 
         html.append(
             f"<td class=\"name\">"
-            f"{html_escape(row['name'])}"
+            f"{name}"
             f"</td>"
         )
 
@@ -2249,17 +3071,17 @@ def build_quote_table(
             )
 
         html.append(
-            f"<td class=\"number "
-            f"{pct_class(daily)}\">"
-            f"{format_pct(daily)}"
-            f"</td>"
+            pct_cell(row["daily"])
         )
 
+        if include_after_hours:
+            after_hours = row.get("after_hours")
+            html.append(
+                pct_cell(after_hours["pct"] if after_hours else None)
+            )
+
         html.append(
-            f"<td class=\"number "
-            f"{pct_class(ytd)}\">"
-            f"{format_pct(ytd)}"
-            f"</td>"
+            pct_cell(row["ytd"])
         )
 
         html.append(
@@ -2274,7 +3096,7 @@ def build_quote_table(
     return "".join(html)
 
 
-def build_labeled_table(rows):
+def build_labeled_table(rows, relative_to=None):
     """Build HTML tables for sectors and factors."""
 
     if not rows:
@@ -2293,15 +3115,21 @@ def build_labeled_table(rows):
         "<th>Ticker</th>"
         "<th>Daily</th>"
         "<th>YTD</th>"
+    )
+
+    if relative_to:
+        html.append(
+            f"<th>Daily vs {html_escape(relative_to)}</th>"
+            f"<th>YTD vs {html_escape(relative_to)}</th>"
+        )
+
+    html.append(
         "</tr>"
         "</thead>"
         "<tbody>"
     )
 
     for row in rows:
-
-        daily = row["daily"]
-        ytd = row["ytd"]
 
         html.append(
             "<tr>"
@@ -2311,14 +3139,17 @@ def build_labeled_table(rows):
             f"<td class=\"ticker\">"
             f"{html_escape(row['ticker'])}"
             f"</td>"
-            f"<td class=\"number "
-            f"{pct_class(daily)}\">"
-            f"{format_pct(daily)}"
-            f"</td>"
-            f"<td class=\"number "
-            f"{pct_class(ytd)}\">"
-            f"{format_pct(ytd)}"
-            f"</td>"
+            + pct_cell(row["daily"])
+            + pct_cell(row["ytd"])
+        )
+
+        if relative_to:
+            html.append(
+                pct_cell(row.get("rel_daily"), " pp")
+                + pct_cell(row.get("rel_ytd"), " pp")
+            )
+
+        html.append(
             "</tr>"
         )
 
@@ -2328,6 +3159,15 @@ def build_labeled_table(rows):
     )
 
     return "".join(html)
+
+
+def sort_by_daily(rows):
+    """Sort high-to-low by daily return, with n/a rows last."""
+
+    return sorted(
+        rows,
+        key=lambda x: (x["daily"] is None, -(x["daily"] or 0)),
+    )
 
 
 def build_macro_table(macro):
@@ -2350,6 +3190,7 @@ def build_macro_table(macro):
                     <th>Rate</th>
                     <th>Yield</th>
                     <th>Daily Change</th>
+                    <th>As Of</th>
                 </tr>
             </thead>
             <tbody>
@@ -2374,6 +3215,9 @@ def build_macro_table(macro):
                 f"<td class=\"number "
                 f"{pct_class(change)}\">"
                 f"{change:+.1f} bps"
+                f"</td>"
+                f"<td class=\"number\">"
+                f"{html_escape(row['as_of'])}"
                 f"</td>"
                 "</tr>"
             )
@@ -2426,15 +3270,9 @@ def build_macro_table(macro):
                 f"<td class=\"number\">"
                 f"{row['value']:.2f}"
                 f"</td>"
-                f"<td class=\"number "
-                f"{pct_class(daily)}\">"
-                f"{format_pct(daily)}"
-                f"</td>"
-                f"<td class=\"number "
-                f"{pct_class(ytd)}\">"
-                f"{format_pct(ytd)}"
-                f"</td>"
-                "</tr>"
+                + pct_cell(daily)
+                + pct_cell(ytd)
+                + "</tr>"
             )
 
         html += (
@@ -2709,6 +3547,256 @@ def build_paragraph(
     )
 
 
+def build_recent_earnings_table(rows):
+    if not rows:
+        return "<p>No impactful earnings reported since the previous close.</p>"
+
+    html = [
+        '<table class="data-table">'
+        "<thead><tr>"
+        "<th>Ticker</th><th>Name</th><th>Reported</th>"
+        "<th>EPS vs Est.</th><th>Surprise</th>"
+        "<th>Session</th><th>After Hours</th>"
+        "</tr></thead><tbody>"
+    ]
+
+    for r in rows:
+
+        if r["eps_actual"] is not None:
+            eps = (
+                f"{r['eps_actual']:.2f} vs "
+                + (
+                    f"{r['eps_forecast']:.2f}"
+                    if r["eps_forecast"] is not None
+                    else "n/a"
+                )
+            )
+        else:
+            eps = "n/a"
+
+        html.append(
+            "<tr>"
+            f"<td class=\"ticker\">{html_escape(r['ticker'])}</td>"
+            f"<td class=\"name\">{html_escape(r['name'])}</td>"
+            f"<td>{html_escape(r['reported'])}</td>"
+            f"<td class=\"number\">{html_escape(eps)}</td>"
+            + pct_cell(r["surprise_pct"])
+            + pct_cell(r["session_move"])
+            + pct_cell(r["after_hours"])
+            + "</tr>"
+        )
+
+    html.append("</tbody></table>")
+
+    return "".join(html)
+
+
+def build_upcoming_earnings_table(rows):
+    if not rows:
+        return "<p>No major upcoming earnings found.</p>"
+
+    html = [
+        '<table class="data-table">'
+        "<thead><tr>"
+        "<th>Date</th><th>Timing</th><th>Ticker</th><th>Name</th>"
+        "<th>Mkt Cap</th><th>EPS Est.</th>"
+        "</tr></thead><tbody>"
+    ]
+
+    for e in rows:
+
+        name = html_escape(e["name"])
+
+        if e.get("tracked"):
+            name = f"<strong>{name}</strong> (tracked)"
+
+        eps = (
+            f"{e['eps_forecast']:.2f}"
+            if e.get("eps_forecast") is not None
+            else "n/a"
+        )
+
+        html.append(
+            "<tr>"
+            f"<td>{html_escape(e['date'])}</td>"
+            f"<td>{html_escape(e['time'])}</td>"
+            f"<td class=\"ticker\">{html_escape(e['ticker'])}</td>"
+            f"<td class=\"name\">{name}</td>"
+            f"<td class=\"number\">{fmt_market_cap(e.get('market_cap'))}</td>"
+            f"<td class=\"number\">{eps}</td>"
+            "</tr>"
+        )
+
+    html.append("</tbody></table>")
+
+    return "".join(html)
+
+
+# Data-quality audits
+
+def run_cross_listing_checks():
+    """
+    AUDIT: reconcile CAD-listed unhedged ETFs against their USD equivalent.
+
+    expected CAD return = (1 + USD ETF return) * (1 + USD/CAD change) - 1
+
+    Small residuals (fees, withholding tax, FX fixing time) are normal;
+    large ones mean one of the price series is wrong or stale.
+    """
+
+    results = []
+
+    for cad_ticker, (usd_ticker, fx_ticker) in CROSS_LISTING_CHECKS.items():
+
+        cad = get_quote(cad_ticker)
+        usd = get_quote(usd_ticker)
+        fx = get_quote(fx_ticker)
+
+        if not (cad and usd and fx):
+            continue
+
+        for field, tolerance in (("daily", 0.75), ("ytd", 1.5)):
+
+            if None in (cad[field], usd[field], fx[field]):
+                continue
+
+            expected = (
+                (1 + usd[field] / 100) * (1 + fx[field] / 100) - 1
+            ) * 100
+            residual = cad[field] - expected
+
+            result = {
+                "ticker": cad_ticker,
+                "vs": usd_ticker,
+                "field": "Daily" if field == "daily" else "YTD",
+                "actual": cad[field],
+                "usd": usd[field],
+                "fx": fx[field],
+                "expected": expected,
+                "residual": residual,
+                "ok": abs(residual) <= tolerance,
+            }
+
+            results.append(result)
+
+            if not result["ok"]:
+                audit(
+                    f"{cad_ticker} {result['field']} {cad[field]:+.2f}% does "
+                    f"not reconcile with {usd_ticker} {usd[field]:+.2f}% and "
+                    f"USD/CAD {fx[field]:+.2f}% (expected {expected:+.2f}%, "
+                    f"residual {residual:+.2f} pp)."
+                )
+
+    return results
+
+
+def run_portfolio_coverage_checks(portfolio_definitions):
+    for portfolio_name, rows, weights in portfolio_definitions:
+
+        if not weights:
+            continue
+
+        missing = sorted(
+            set(weights) - {r["ticker"] for r in rows}
+        )
+
+        if missing:
+            audit(
+                f"{portfolio_name}: weighted holdings with no data: "
+                f"{', '.join(missing)}."
+            )
+
+        coverage = portfolio_weight_coverage(rows, "daily", weights)
+
+        if coverage is not None and coverage < 0.995:
+            audit(
+                f"{portfolio_name}: daily weighted return covers only "
+                f"{coverage:.0%} of portfolio weight (stale or missing "
+                "holdings excluded and the rest renormalised)."
+            )
+
+
+def run_ai_number_audit(ai, data_values):
+    """
+    AUDIT: every signed percentage the model writes in the summary, ticker
+    notes, earnings recap and bottom line should match a figure supplied in
+    the data. Unmatched figures are flagged for manual verification.
+    """
+
+    texts = list(ai.get("executive_summary", []))
+    texts += list(ai.get("earnings_recap", []))
+    texts.append(ai.get("bottom_line", ""))
+    texts += [
+        v.get("note", "") for v in ai.get("tickers", {}).values()
+    ]
+
+    known = [abs(v) for v in data_values if v is not None]
+
+    unmatched = []
+
+    for text in texts:
+        for match in re.finditer(r"([+\-−]?\d+(?:\.\d+)?)\s?%", text or ""):
+            value = abs(float(match.group(1).replace("−", "-")))
+
+            if value == 0:
+                continue
+
+            if not any(abs(value - k) <= 0.06 for k in known):
+                unmatched.append(match.group(0))
+
+    for figure in sorted(set(unmatched))[:10]:
+        audit(
+            f"AI text cites {figure}, which does not match any figure in "
+            "the dashboard data; verify before relying on it.",
+            level="CHECK",
+        )
+
+
+def build_audit_section(cross_checks):
+    html = ""
+
+    if cross_checks:
+        html += (
+            "<h2>Cross-Listing Reconciliation (CAD vs USD)</h2>"
+            '<table class="data-table"><thead><tr>'
+            "<th>ETF</th><th>Period</th><th>Actual</th>"
+            "<th>USD ETF</th><th>USD/CAD</th><th>Expected</th>"
+            "<th>Residual</th></tr></thead><tbody>"
+        )
+
+        for c in cross_checks:
+            html += (
+                "<tr>"
+                f"<td class=\"ticker\">{html_escape(c['ticker'])}</td>"
+                f"<td>{c['field']}</td>"
+                + pct_cell(c["actual"])
+                + f"<td class=\"number\">{html_escape(c['vs'])} "
+                f"{format_pct(c['usd'])}</td>"
+                + pct_cell(c["fx"])
+                + pct_cell(c["expected"])
+                + f"<td class=\"number\">{format_pct(c['residual'], ' pp')}"
+                f"{'' if c['ok'] else ' ⚠'}</td>"
+                "</tr>"
+            )
+
+        html += "</tbody></table>"
+
+    if AUDIT_LOG:
+        html += "<h2>Data Quality Flags</h2><ul>"
+
+        for entry in AUDIT_LOG:
+            html += (
+                f"<li><strong>{html_escape(entry['level'])}:</strong> "
+                f"{html_escape(entry['message'])}</li>"
+            )
+
+        html += "</ul>"
+    else:
+        html += "<p>All data-quality checks passed.</p>"
+
+    return html
+
+
 # Email composition
 
 def compose_email(
@@ -2723,10 +3811,11 @@ def compose_email(
     market_news,
     lookahead,
     ai,
+    recent_earnings=(),
+    cross_checks=(),
 ):
-    now = datetime.now(
-        MARKET_TZ
-    ).strftime(
+    # AUDIT FIX: show the session the data describes, not the run date.
+    now = session_date().strftime(
         "%A, %B %d, %Y"
     )
 
@@ -2916,6 +4005,11 @@ li {{
     margin-bottom: 26px;
 }}
 
+.flag {{
+    font-size: 12px;
+    color: #8a5a00;
+}}
+
 .source {{
     font-size: 12px;
 
@@ -2949,7 +4043,7 @@ li {{
 <body>
 <div class="container">
 
-<h1>Daily Investment Review</h1>
+<h1>Daily Market Review</h1>
 
 <p class="date">
 {html_escape(now)}
@@ -3016,6 +4110,16 @@ YTD
         else:
             html += "<p>Weighted return unavailable; check portfolio weights and holdings data.</p>"
 
+        coverage = portfolio_weight_coverage(
+            portfolio_rows, "daily", portfolio_weights
+        )
+
+        if coverage is not None and coverage < 0.995:
+            html += (
+                f'<p class="flag">Daily weighted return covers '
+                f"{coverage:.0%} of portfolio weight; see Data Quality.</p>"
+            )
+
         html += build_quote_table(portfolio_rows, include_price=True)
 
     html += f"""
@@ -3023,22 +4127,15 @@ YTD
 <h2>Sector Performance</h2>
 
 {build_labeled_table(
-    sorted(
-        sectors,
-        key=lambda x: x["daily"],
-        reverse=True,
-    )
+    sort_by_daily(sectors)
 )}
 
 
 <h2>Factor / Style Performance</h2>
 
 {build_labeled_table(
-    sorted(
-        factors,
-        key=lambda x: x["daily"],
-        reverse=True,
-    )
+    sort_by_daily(factors),
+    relative_to=FACTOR_BENCHMARK,
 )}
 
 
@@ -3047,6 +4144,7 @@ YTD
 {build_quote_table(
     tickers,
     include_price=True,
+    include_after_hours=True,
 )}
 
 <h2>Company-by-Company Review</h2>
@@ -3067,9 +4165,27 @@ YTD
 
 
 
-<!-- 4. Top Market Stories -->
+<!-- 4. Earnings & After-Hours -->
 
-<h1>4. Top Market Stories</h1>
+<h1>4. Earnings &amp; After-Hours</h1>
+
+<h2>Reported Since the Previous Close</h2>
+
+{build_recent_earnings_table(
+    recent_earnings
+)}
+
+{build_bullet_list(
+    ai.get(
+        "earnings_recap",
+        []
+    )
+) if ai.get("earnings_recap") else ""}
+
+
+<!-- 5. Top Market Stories -->
+
+<h1>5. Top Market Stories</h1>
 
 {build_market_stories(
     market_news,
@@ -3077,9 +4193,9 @@ YTD
 )}
 
 
-<!-- 5. Investment Implications -->
+<!-- 6. Investment Implications -->
 
-<h1>5. Investment Implications</h1>
+<h1>6. Investment Implications</h1>
 
 
 <h2>Bull Case</h2>
@@ -3121,47 +4237,17 @@ YTD
 )}
 
 
-<!-- 6. Looking Ahead -->
+<!-- 7. Looking Ahead -->
 
-<h1>6. Looking Ahead</h1>
+<h1>7. Looking Ahead</h1>
 
 
 <h2>Upcoming Earnings</h2>
 """
 
-    if lookahead[
-        "earnings"
-    ]:
-
-        html += "<ul>"
-
-        for earnings in sorted(
-            lookahead["earnings"],
-            key=lambda x: x["date"],
-        ):
-
-            html += (
-                "<li>"
-                f"<strong>"
-                f"{html_escape(earnings['date'])}"
-                f"</strong>: "
-                f"{html_escape(earnings['ticker'])} "
-                f"("
-                f"{html_escape(earnings['name'])}"
-                f")"
-                "</li>"
-            )
-
-        html += "</ul>"
-
-    else:
-
-        html += (
-            "<p>"
-            "No upcoming tracked-company "
-            "earnings found."
-            "</p>"
-        )
+    html += build_upcoming_earnings_table(
+        lookahead["earnings"]
+    )
 
     if lookahead[
         "macro"
@@ -3201,9 +4287,9 @@ YTD
 )}
 
 
-<!-- 7. Bottom Line -->
+<!-- 8. Bottom Line -->
 
-<h1>7. Bottom Line</h1>
+<h1>8. Bottom Line</h1>
 
 {build_paragraph(
     ai.get(
@@ -3213,9 +4299,20 @@ YTD
 )}
 
 
+<!-- 9. Data Quality -->
+
+<h1>9. Data Quality</h1>
+
+{build_audit_section(
+    cross_checks
+)}
+
+
 <div class="footer">
 Generated automatically via
-Yahoo Finance, Tavily, FRED &amp; Groq
+Yahoo Finance, U.S. Treasury, Nasdaq, Tavily, FRED &amp; Groq.
+Returns are total returns in each security's local currency, measured
+from the adjusted previous close; YTD from the prior year's final close.
 </div>
 
 </div>
@@ -3294,7 +4391,8 @@ def send_email(
 
 def main():
 
-    # Confirm fresh market data.
+    # Confirm fresh market data (also fixes today's and the previous
+    # session dates used by every return calculation).
 
     if not has_fresh_data(
         "^GSPC"
@@ -3335,6 +4433,7 @@ def main():
     tickers = gather_group(
         config.TICKERS,
         with_headlines=True,
+        with_after_hours=True,
     )
 
     print(
@@ -3371,7 +4470,8 @@ def main():
     )
 
     factors = gather_labeled_etfs(
-        FACTOR_ETFS
+        FACTOR_ETFS,
+        benchmark=FACTOR_BENCHMARK,
     )
 
     print(
@@ -3389,6 +4489,12 @@ def main():
             limit=10
         )
     )
+
+    print(
+        "Gathering recent earnings..."
+    )
+
+    recent_earnings = gather_recent_earnings()
 
     print(
         "Gathering lookahead..."
@@ -3415,6 +4521,20 @@ def main():
 
         return
 
+    # Data-quality audits on the gathered data.
+
+    print(
+        "Running data-quality audits..."
+    )
+
+    cross_checks = run_cross_listing_checks()
+
+    run_portfolio_coverage_checks([
+        ("Index Portfolio", index_portfolio, INDEX_PORTFOLIO_WEIGHTS),
+        ("Avantis Portfolio", avantis_portfolio, AVANTIS_PORTFOLIO_WEIGHTS),
+        ("Current Portfolio", portfolio, PORTFOLIO_WEIGHTS),
+    ])
+
     # Generate AI analysis.
 
     print(
@@ -3430,19 +4550,53 @@ def main():
         macro=macro,
         market_news=market_news,
         lookahead=lookahead,
+        recent_earnings=recent_earnings,
     )
+
+    # Check that the model's figures exist in the supplied data.
+
+    data_values = []
+
+    for row in (
+        indices + tickers + portfolio + index_portfolio
+        + avantis_portfolio + sectors + factors + macro["cross_asset"]
+    ):
+        data_values += [row.get("daily"), row.get("ytd")]
+        data_values += [row.get("rel_daily"), row.get("rel_ytd")]
+        if row.get("after_hours"):
+            data_values.append(row["after_hours"]["pct"])
+
+    for row in recent_earnings:
+        data_values += [
+            row["session_move"], row["after_hours"], row["surprise_pct"]
+        ]
+
+    for row in macro["rates"]:
+        data_values.append(row["value"])
+
+    for _, rows, weights in (
+        ("", index_portfolio, INDEX_PORTFOLIO_WEIGHTS),
+        ("", avantis_portfolio, AVANTIS_PORTFOLIO_WEIGHTS),
+        ("", portfolio, PORTFOLIO_WEIGHTS),
+    ):
+        for field in ("daily", "ytd"):
+            data_values.append(
+                calculate_weighted_portfolio_return(rows, field, weights)
+            )
+
+    run_ai_number_audit(ai, data_values)
 
     # Build and send the email.
 
     today_str = (
-        market_today()
+        session_date()
         .strftime(
             "%a, %b %d %Y"
         )
     )
 
     subject = (
-        "Daily Investment Review — "
+        "Daily Market Review — "
         f"{today_str}"
     )
 
@@ -3458,6 +4612,8 @@ def main():
         market_news=market_news,
         lookahead=lookahead,
         ai=ai,
+        recent_earnings=recent_earnings,
+        cross_checks=cross_checks,
     )
 
     send_email(
@@ -3466,7 +4622,7 @@ def main():
     )
 
     print(
-        "Daily investment review "
+        "Daily Market Review "
         "email sent."
     )
 
