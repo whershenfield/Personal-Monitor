@@ -1635,7 +1635,7 @@ Return JSON exactly in this shape:
   "source_index": 1}}]}}
 
 RULES
-- Pick the 3-5 most important DISTINCT stories, like tonight's front page
+- Pick the 4-5 most important DISTINCT stories, like tonight's front page
   of Bloomberg, the FT or Reuters: central banks, economic data, policy,
   geopolitics and trade, big moves in rates/currencies/commodities/credit,
   major industry or corporate news.
@@ -1643,6 +1643,8 @@ RULES
 - Each summary: what happened, context, why investors care, what could
   matter next. Use only the supplied material; never invent facts.
 - source_index is the number of the headline the story is based on.
+- Don't pick stories that exclusively discuss a certain company's
+  upcoming/previous earnings report.
 - If there's only enough material for one or two stories, return those.
 """
     parsed = _groq_call(prompt, max_tokens=4000, temperature=0.3,
