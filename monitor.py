@@ -4,6 +4,7 @@ import os
 import csv
 import io
 import re
+import time
 from functools import lru_cache
 from datetime import datetime, date, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -57,37 +58,19 @@ DEFAULT_SECTOR_ETFS = {
     "Materials": "XLB",
 }
 
-# Factor proxies. Each factor is shown as a long-minus-short return spread,
-# which is how Fama-French factors are actually defined. Where no ETF exists
-# for the "short" side, the factor ETF is measured against a broad benchmark
-# from the same size universe (IWB = Russell 1000) so the spread isolates the
-# factor tilt rather than a size effect.
-#
-# Can be overridden in config.py with FACTOR_DEFINITIONS (same structure).
-# NOTE: the old FACTOR_ETFS setting is no longer used.
-DEFAULT_FACTOR_DEFINITIONS = [
-    {"group": "Fama-French Five Factors", "label": "Market (Mkt-RF)",
-     "long": "VTI", "short": None},
-    {"group": "Fama-French Five Factors", "label": "Size (SMB)",
-     "long": "IWM", "short": "IWB"},
-    {"group": "Fama-French Five Factors", "label": "Value (HML)",
-     "long": "IWD", "short": "IWF"},
-    {"group": "Fama-French Five Factors", "label": "Profitability (RMW)",
-     "long": "QUAL", "short": "IWB"},
-    {"group": "Fama-French Five Factors", "label": "Investment (CMA)",
-     "long": "COWZ", "short": "IWB"},
-    {"group": "Other Style Factors", "label": "Momentum",
-     "long": "MTUM", "short": "IWB"},
-    {"group": "Other Style Factors", "label": "Minimum Volatility",
-     "long": "USMV", "short": "IWB"},
-    {"group": "Other Style Factors", "label": "Equal Weight vs. Cap Weight",
-     "long": "RSP", "short": "SPY"},
-]
+# Default factor/style ETF proxies; can be overridden in config.py.
+DEFAULT_FACTOR_ETFS = {
+    "Growth": "VUG",
+    "Momentum": "MTUM",
+    "Quality": "QUAL",
+    "Value": "VTV",
+    "Minimum Volatility": "USMV",
+    "Small Cap": "IWM",
+    "Equal Weight": "RSP",
+}
 
 SECTOR_ETFS = getattr(config, "SECTOR_ETFS", DEFAULT_SECTOR_ETFS)
-FACTOR_DEFINITIONS = getattr(
-    config, "FACTOR_DEFINITIONS", DEFAULT_FACTOR_DEFINITIONS
-)
+FACTOR_ETFS = getattr(config, "FACTOR_ETFS", DEFAULT_FACTOR_ETFS)
 
 # Optional custom security names and news keywords.
 TICKER_NAMES = getattr(config, "TICKER_NAMES", {})
@@ -103,7 +86,8 @@ AVANTIS_PORTFOLIO_WEIGHTS = getattr(config, "AVANTIS_PORTFOLIO_WEIGHTS", {})
 # Earnings settings (overridable in config.py).
 RECENT_EARNINGS_LIMIT = getattr(config, "RECENT_EARNINGS_LIMIT", 6)
 RECENT_EARNINGS_MIN_CAP = getattr(config, "RECENT_EARNINGS_MIN_CAP", 10e9)
-UPCOMING_EARNINGS_LIMIT = getattr(config, "UPCOMING_EARNINGS_LIMIT", 12)
+UPCOMING_EARNINGS_DAYS = getattr(config, "UPCOMING_EARNINGS_DAYS", 2)
+UPCOMING_EARNINGS_LIMIT = getattr(config, "UPCOMING_EARNINGS_LIMIT", 8)
 UPCOMING_EARNINGS_MIN_CAP = getattr(config, "UPCOMING_EARNINGS_MIN_CAP", 20e9)
 
 
@@ -639,40 +623,6 @@ def gather_sectors(mapping):
     return rows
 
 
-def gather_factors(definitions):
-    """Factor returns as long-minus-short spreads."""
-    rows = []
-    for f in definitions:
-        long_q = get_quote(f["long"])
-        if long_q is None:
-            print(f"Could not fetch factor ETF {f['long']}")
-            continue
-        short = f.get("short")
-        if short:
-            short_q = get_quote(short)
-            if short_q is None:
-                print(f"Could not fetch factor benchmark {short}")
-                continue
-            daily = long_q["daily"] - short_q["daily"]
-            ytd = long_q["ytd"] - short_q["ytd"]
-            proxy = f"{f['long']} − {short}"
-            stale = long_q["stale"] or short_q["stale"]
-        else:
-            daily, ytd = long_q["daily"], long_q["ytd"]
-            proxy = f["long"]
-            stale = long_q["stale"]
-        rows.append({
-            "group": f.get("group", "Factors"),
-            "label": f["label"],
-            "ticker": proxy,
-            "daily": daily,
-            "ytd": ytd,
-            "stale": stale,
-            "as_of": long_q["as_of"],
-        })
-    return rows
-
-
 # ---------------------------------------------------------------------------
 # Portfolio calculations
 # ---------------------------------------------------------------------------
@@ -1018,21 +968,31 @@ def extract_earnings_dates(calendar):
     return results
 
 
+def next_business_days(start, count):
+    days, d = [], start
+    while len(days) < count:
+        d = next_day(d)
+        if d.weekday() < 5:
+            days.append(d)
+    return days
+
+
 def gather_upcoming_earnings():
-    """Largest upcoming reports over the next week, plus tracked names."""
+    """
+    Largest reports over the next two business days, plus any tracked
+    holdings in that window, each with preview coverage for the AI blurb.
+    """
     today = market_today()
-    horizon = today + timedelta(days=7)
+    window = next_business_days(today, UPCOMING_EARNINGS_DAYS)
+    horizon = window[-1]
     tracked = list(dict.fromkeys(config.TICKERS + config.PORTFOLIO))
 
     upcoming = []
-    day = next_day(today)
-    while day <= horizon:
-        if day.weekday() < 5:
-            rows = fetch_earnings_calendar(day) or []
-            upcoming += [
-                r for r in rows if r["market_cap"] >= UPCOMING_EARNINGS_MIN_CAP
-            ]
-        day = next_day(day)
+    for day in window:
+        rows = fetch_earnings_calendar(day) or []
+        upcoming += [
+            r for r in rows if r["market_cap"] >= UPCOMING_EARNINGS_MIN_CAP
+        ]
 
     upcoming.sort(key=lambda r: r["market_cap"], reverse=True)
     upcoming = upcoming[:UPCOMING_EARNINGS_LIMIT]
@@ -1066,7 +1026,24 @@ def gather_upcoming_earnings():
 
     for r in upcoming:
         r.setdefault("tracked", r["ticker"] in tracked)
+        _EXTRA_NAMES.setdefault(r["ticker"], r["name"])
+
+        news = tavily_search(
+            f'"{r["name"]}" earnings preview what to expect analysts',
+            days=7,
+            max_results=6,
+        )
+        relevant = [
+            h for h in news
+            if mentions_company(r["ticker"], f"{h['title']} {h['snippet']}")
+        ]
+        r["headlines"] = sort_by_recency(dedupe_headlines(relevant))[:3]
+
     upcoming.sort(key=lambda r: (r["date"], -r["market_cap"]))
+    print(
+        f"Upcoming earnings ({window[0]} to {horizon}): "
+        f"{', '.join(r['ticker'] for r in upcoming) or 'none'}"
+    )
     return upcoming
 
 
@@ -1104,7 +1081,22 @@ def gather_lookahead():
 # Groq API
 # ---------------------------------------------------------------------------
 
-def _groq_call(prompt, max_tokens=6500, temperature=0.3):
+def _retry_after_seconds(response, default=20.0, cap=65.0):
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return min(float(header) + 1, cap)
+        except ValueError:
+            pass
+    match = re.search(r"try again in ([\d.]+)(ms|s|m)", response.text)
+    if match:
+        value, unit = float(match.group(1)), match.group(2)
+        secs = value / 1000 if unit == "ms" else value * 60 if unit == "m" else value
+        return min(secs + 1, cap)
+    return default
+
+
+def _groq_call(prompt, max_tokens=4000, temperature=0.3, label="ai"):
     """Call Groq, log useful diagnostics, and parse its JSON response."""
     api_key = getattr(config, "GROQ_API_KEY", "")
     if not api_key:
@@ -1115,30 +1107,64 @@ def _groq_call(prompt, max_tokens=6500, temperature=0.3):
         "model": "openai/gpt-oss-120b",
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "messages": [{"role": "user", "content": prompt}],
+        # gpt-oss "thinks" before answering, and that hidden reasoning
+        # counts against max_tokens. Medium keeps quality without
+        # crowding out the actual answer.
+        "reasoning_effort": "medium",
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": "You reply with a single valid JSON object only.",
+            },
+            {"role": "user", "content": prompt},
+        ],
     }
     print(
-        f"Calling Groq: model={payload['model']}, "
-        f"prompt_length={len(prompt)}, max_tokens={max_tokens}"
+        f"Calling Groq [{label}]: prompt_length={len(prompt)}, "
+        f"max_tokens={max_tokens}"
     )
 
-    try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=180,
-        )
-    except Exception as e:
-        print(f"Groq request exception: {type(e).__name__}: {e}")
+    response = None
+    for attempt in range(1, 5):
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=180,
+            )
+        except Exception as e:
+            print(f"Groq request exception: {type(e).__name__}: {e}")
+            time.sleep(10)
+            continue
+
+        status = response.status_code
+        print(f"Groq [{label}] HTTP status: {status} (attempt {attempt})")
+        if status == 200:
+            break
+
+        body_text = response.text[:2000]
+        print(f"Groq error body: {body_text}")
+
+        if status == 400 and ("response_format" in body_text
+                              or "json_validate_failed" in body_text):
+            # JSON mode rejected or the model's output failed validation;
+            # retry once in plain mode and parse the JSON ourselves.
+            payload.pop("response_format", None)
+            continue
+        if status in (413, 429) or status >= 500:
+            wait = _retry_after_seconds(response)
+            print(f"Groq rate-limited or busy; waiting {wait:.0f}s.")
+            time.sleep(wait)
+            continue
         return None
 
-    print(f"Groq HTTP status: {response.status_code}")
-    if response.status_code != 200:
-        print(f"Groq error body: {response.text[:2000]}")
+    if response is None or response.status_code != 200:
+        print(f"Groq [{label}] failed after retries.")
         return None
 
     try:
@@ -1186,21 +1212,99 @@ def _groq_call(prompt, max_tokens=6500, temperature=0.3):
         print(f"Groq JSON top-level was {type(parsed).__name__}, not object.")
         return None
 
-    print(f"Groq JSON parsed successfully; keys={list(parsed.keys())}")
+    shape = {k: type(v).__name__ for k, v in parsed.items()}
+    print(f"Groq [{label}] JSON parsed; keys/types={shape}")
     return parsed
 
 
-def _clean_list(value, limit=None):
-    if not isinstance(value, list):
-        return []
-    items = [str(v).strip() for v in value if str(v).strip()]
+# ---------------------------------------------------------------------------
+# Tolerant readers for model output
+#
+# The model doesn't always follow the requested shape exactly (a bullet
+# list comes back as one string, "title" becomes "headline", everything
+# gets wrapped in an extra {"report": {...}} layer, and so on). Strict
+# parsing silently threw those sections away; these helpers accept the
+# common variations instead.
+# ---------------------------------------------------------------------------
+
+def _nk(key):
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def _pick(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    norm = {_nk(k): v for k, v in d.items()}
+    for k in keys:
+        v = norm.get(_nk(k))
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
+def _unwrap(parsed, expected):
+    """If the expected keys are nested one level down, return that level."""
+    if not isinstance(parsed, dict):
+        return {}
+    if _pick(parsed, *expected) is not None:
+        return parsed
+    for v in parsed.values():
+        if isinstance(v, dict) and _pick(v, *expected) is not None:
+            return v
+    return parsed
+
+
+def _text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        v = _pick(value, "text", "point", "bullet", "summary", "content",
+                  "note", "blurb", "value", "description")
+        if v is not None:
+            return _text(v)
+        return " ".join(_text(x) for x in value.values() if _text(x))
+    if isinstance(value, (list, tuple)):
+        return " ".join(_text(x) for x in value if _text(x))
+    return str(value).strip()
+
+
+_BULLET_PREFIX = re.compile(r"^\s*(?:[-*•·]+|\d+[.)])\s*")
+
+
+def _as_text_list(value, limit=None):
+    items = []
+    if isinstance(value, str):
+        items = [_BULLET_PREFIX.sub("", line).strip()
+                 for line in value.splitlines()]
+    elif isinstance(value, (list, tuple)):
+        items = [_text(v) for v in value]
+    elif isinstance(value, dict):
+        items = [_text(v) for v in value.values()]
+    items = [i for i in items if i]
     return items[:limit] if limit else items
 
 
-def _clean_cites(value):
-    if not isinstance(value, list):
+def _as_int_list(value):
+    if isinstance(value, bool):
         return []
-    return [c for c in value if isinstance(c, int)]
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, str):
+        return [int(x) for x in re.findall(r"\d+", value)]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            out += _as_int_list(v)
+        return out
+    return []
+
+
+def _clean_cites(value):
+    return _as_int_list(value)
 
 
 def _fmt_headline_lines(headlines, snippet_chars=280):
@@ -1216,8 +1320,58 @@ def _fmt_headline_lines(headlines, snippet_chars=280):
     return lines
 
 
+def _keyed_entries(value, key_field="ticker"):
+    """Accept {"AAPL": {...}} or [{"ticker": "AAPL", ...}] alike."""
+    out = {}
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out[str(k).strip().upper()] = v
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                k = _text(_pick(item, key_field, "symbol"))
+                if k:
+                    out[k.upper()] = item
+    return out
+
+
 # ---------------------------------------------------------------------------
-# AI: earnings recap
+# Prompt formatting shared by the AI calls
+# ---------------------------------------------------------------------------
+
+def _stale_tag(r):
+    return f" [last data {r['as_of']}]" if r.get("stale") else ""
+
+
+def _fmt_rows(rows, key="ticker", label_key="name"):
+    return "\n".join(
+        f"{r[key]} ({r[label_key]}) | daily {r['daily']:+.2f}% | "
+        f"YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
+        for r in rows
+    ) or "(unavailable)"
+
+
+def _fmt_macro(m):
+    lines = []
+    for r in m.get("rates", []):
+        lines.append(
+            f"{r['label']} | {r['value']:.2f}% | "
+            f"{r['daily_bps']:+.1f} bps | as of {r['as_of']}"
+        )
+    for r in m.get("cross_asset", []):
+        lines.append(
+            f"{r['label']} | {r['value']:.2f} | daily "
+            f"{r['daily']:+.2f}% | YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
+        )
+    return "\n".join(lines) or "(no macro data)"
+
+
+def _report_date():
+    return market_today().strftime("%A, %B %d, %Y")
+
+
+# ---------------------------------------------------------------------------
+# AI: earnings recap (companies that just reported)
 # ---------------------------------------------------------------------------
 
 def build_earnings_summary(recent):
@@ -1226,7 +1380,6 @@ def build_earnings_summary(recent):
     if not companies and not general:
         return []
 
-    report_date = market_today().strftime("%A, %B %d, %Y")
     lines = []
     for c in companies:
         lines.append(
@@ -1237,7 +1390,7 @@ def build_earnings_summary(recent):
             f"surprise {c.get('surprise') or 'n/a'} | {c['reaction_note']}"
         )
         if c["headlines"]:
-            lines += _fmt_headline_lines(c["headlines"], snippet_chars=600)
+            lines += _fmt_headline_lines(c["headlines"], snippet_chars=450)
         else:
             lines.append("  (no results coverage found)")
 
@@ -1245,363 +1398,423 @@ def build_earnings_summary(recent):
     if general:
         general_block = (
             "\nGENERAL EARNINGS NEWS (use for companies not listed above):\n"
-            + "\n".join(_fmt_headline_lines(general, snippet_chars=600))
+            + "\n".join(_fmt_headline_lines(general, snippet_chars=450))
         )
 
     prompt = f"""
 You are writing the earnings recap section of a professional daily market
-review dated {report_date}, delivered after the U.S. close.
-
-Respond with ONE JSON OBJECT ONLY, no markdown.
+review dated {_report_date()}, delivered after the U.S. close.
 
 COMPANIES THAT REPORTED (largest first):
 {chr(10).join(lines) if lines else "(none from calendar)"}
 {general_block}
 
-REQUIRED JSON:
-{{
-  "recent_earnings": [
-    {{
-      "ticker": "<ticker>",
-      "company": "<company name>",
-      "blurb": "<3-5 sentences>",
-      "cites": [1, 2]
-    }}
-  ]
-}}
+Return JSON exactly in this shape:
+{{"recent_earnings": [{{"ticker": "MSFT", "company": "Microsoft",
+  "blurb": "3-5 sentences", "cites": [1, 2]}}]}}
 
 RULES
-- Write one entry per listed company that has results coverage. If
-  GENERAL EARNINGS NEWS is supplied, you may add up to 3 other major
-  companies that clearly reported in the last day; for those, cites
-  refer to the GENERAL list.
-- Each blurb: headline EPS and revenue versus expectations, guidance,
-  the key business driver(s), and the stock reaction given above.
-- Use only numbers and facts present in the supplied material. If the
-  coverage lacks detail, say what is known and that full results
-  details were not available in the sources reviewed.
-- Ignore any headline that is not about that company's own results.
-- Cite headline numbers from that company's own list.
+- One entry per listed company that has results coverage. If GENERAL
+  EARNINGS NEWS is supplied, you may add up to 3 other major companies
+  that clearly reported in the last day; their cites refer to that list.
+- Each blurb: EPS and revenue versus expectations, guidance, the key
+  business driver(s), and the stock reaction given above.
+- Use only numbers and facts in the supplied material. If coverage is
+  thin, say what is known and that full details weren't available.
+- Ignore headlines not about that company's own results.
 - Skip companies with no coverage rather than guessing.
 """
-    parsed = _groq_call(prompt, max_tokens=5000, temperature=0.2)
+    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.2,
+                        label="earnings recap")
     if not parsed:
         return []
 
+    items = _pick(_unwrap(parsed, ["recent_earnings"]),
+                  "recent_earnings", "earnings", "companies")
     out = []
-    for item in parsed.get("recent_earnings") or []:
+    for ticker, item in _keyed_entries(items).items():
         if not isinstance(item, dict):
-            continue
-        blurb = str(item.get("blurb") or "").strip()
+            item = {"blurb": item}
+        blurb = _text(_pick(item, "blurb", "summary", "note", "text"))
         if not blurb:
             continue
         out.append({
-            "ticker": str(item.get("ticker") or "").strip().upper(),
-            "company": str(item.get("company") or "").strip(),
+            "ticker": ticker,
+            "company": _text(_pick(item, "company", "name")),
             "blurb": blurb,
-            "cites": _clean_cites(item.get("cites")),
+            "cites": _clean_cites(_pick(item, "cites", "sources")),
         })
     return out
 
 
 # ---------------------------------------------------------------------------
-# AI: main analysis
+# AI: upcoming earnings previews (next two business days)
 # ---------------------------------------------------------------------------
 
-def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
-                     market_news, lookahead, recent_earnings, earnings_notes):
+def build_earnings_previews(upcoming):
+    if not upcoming:
+        return {}
 
-    report_date = market_today().strftime("%A, %B %d, %Y")
+    lines = []
+    for e in upcoming:
+        tracked = " [TRACKED HOLDING]" if e.get("tracked") else ""
+        lines.append(
+            f"\n{e['ticker']} ({e['name']}){tracked} | reports "
+            f"{e['date'].strftime('%a %b %d')} {e['timing']} | mkt cap "
+            f"{format_cap(e['market_cap'])} | consensus EPS "
+            f"{e.get('eps_forecast') or 'n/a'}"
+        )
+        if e.get("headlines"):
+            lines += _fmt_headline_lines(e["headlines"], snippet_chars=400)
+        else:
+            lines.append("  (no preview coverage found)")
 
-    def stale_tag(r):
-        return f" [last data {r['as_of']}]" if r.get("stale") else ""
+    prompt = f"""
+You are writing the "Upcoming Earnings" section of a professional daily
+market review dated {_report_date()}. For each company reporting in the
+next two business days, write a short preview of what investors should
+watch.
 
-    def fmt_rows(rows, key="ticker", label_key="name"):
-        return "\n".join(
-            f"{r[key]} ({r[label_key]}) | daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%{stale_tag(r)}"
-            for r in rows
-        ) or "(unavailable)"
+COMPANIES:
+{chr(10).join(lines)}
 
-    def fmt_factors(rows):
-        return "\n".join(
-            f"{r['label']} | proxy {r['ticker']} | spread daily "
-            f"{r['daily']:+.2f}% | spread YTD {r['ytd']:+.2f}%{stale_tag(r)}"
-            for r in rows
-        ) or "(unavailable)"
+Return JSON exactly in this shape:
+{{"previews": [{{"ticker": "MSFT", "blurb": "2-4 sentences",
+  "cites": [1]}}]}}
 
-    def fmt_tickers(rows):
-        lines = []
-        for r in rows:
-            lines.append(
-                f"\n{r['ticker']} — {r['name']} | daily {r['daily']:+.2f}% | "
-                f"YTD {r['ytd']:+.2f}%{stale_tag(r)}"
-            )
-            if r["headlines"]:
-                lines += _fmt_headline_lines(r["headlines"])
-            else:
-                lines.append(
-                    "  (no recent company-specific headlines found)"
-                )
-        return "\n".join(lines)
+RULES
+- Write a preview for EVERY company listed.
+- Each blurb names the 2-3 specific things that will move the stock:
+  the key segment or metric, guidance, margins, demand signals, and any
+  issue raised in the preview coverage. Mention the consensus EPS if given.
+- Use preview coverage where supplied and cite it by number. Without
+  coverage, you may rely on the company's well-known business drivers,
+  but never invent figures, estimates or events.
+- Be specific to the company; avoid generic lines like "investors will
+  watch results closely".
+"""
+    parsed = _groq_call(prompt, max_tokens=3000, temperature=0.3,
+                        label="earnings previews")
+    if not parsed:
+        return {}
 
-    def fmt_macro(m):
-        lines = []
-        if m.get("rates"):
-            lines.append("TREASURY RATES")
-            for r in m["rates"]:
-                lines.append(
-                    f"{r['label']} | {r['value']:.2f}% | "
-                    f"{r['daily_bps']:+.1f} bps | as of {r['as_of']}"
-                )
-        if m.get("cross_asset"):
-            lines.append("\nCROSS-ASSET")
-            for r in m["cross_asset"]:
-                lines.append(
-                    f"{r['label']} | {r['value']:.2f} | daily "
-                    f"{r['daily']:+.2f}% | YTD {r['ytd']:+.2f}%{stale_tag(r)}"
-                )
-        return "\n".join(lines) or "(no macro data)"
+    items = _pick(_unwrap(parsed, ["previews"]),
+                  "previews", "upcoming_earnings", "earnings")
+    out = {}
+    for ticker, item in _keyed_entries(items).items():
+        if not isinstance(item, dict):
+            item = {"blurb": item}
+        blurb = _text(_pick(item, "blurb", "preview", "summary", "note"))
+        if blurb:
+            out[ticker] = {
+                "blurb": blurb,
+                "cites": _clean_cites(_pick(item, "cites", "sources")),
+            }
+    return out
 
-    def fmt_news(rows):
-        if not rows:
-            return "(no market news search results)"
-        lines = []
-        for i, h in enumerate(rows, start=1):
-            lines.append(f"[{i}] {h['title']}")
-            lines.append(f"    Publisher: {h['publisher']}")
-            lines.append(f"    Published: {fmt_published(h.get('published'))}")
-            if h.get("snippet"):
-                lines.append(f"    Summary: {h['snippet']}")
-        return "\n".join(lines)
 
-    def fmt_earnings():
-        lines = []
-        if earnings_notes:
-            lines.append("RECENT EARNINGS (already summarized separately)")
-            for e in earnings_notes:
-                lines.append(f"- {e['company'] or e['ticker']}: {e['blurb']}")
-        elif recent_earnings.get("companies"):
-            lines.append("RECENT EARNINGS")
-            for c in recent_earnings["companies"]:
-                lines.append(
-                    f"- {c['ticker']} ({c['name']}), {c['timing']} "
-                    f"{c['date']}: {c['reaction_note']}"
-                )
-        if lookahead["earnings"]:
-            lines.append("\nUPCOMING EARNINGS (next 7 days)")
-            for e in lookahead["earnings"]:
-                tracked = " [TRACKED HOLDING]" if e.get("tracked") else ""
-                lines.append(
-                    f"{e['date']} {e['timing']}: {e['ticker']} ({e['name']}), "
-                    f"mkt cap {format_cap(e['market_cap'])}, "
-                    f"EPS est {e.get('eps_forecast') or 'n/a'}{tracked}"
-                )
-        if lookahead["macro"]:
-            lines.append("\nRECENT MACRO HEADLINES")
-            for h in lookahead["macro"]:
-                lines.append(f"- {h['title']} — {h['publisher']}")
-        return "\n".join(lines) or "(no earnings or lookahead data)"
+# ---------------------------------------------------------------------------
+# AI: company-by-company review
+# ---------------------------------------------------------------------------
 
+def build_ticker_notes(tickers):
+    if not tickers:
+        return {}
+
+    lines = []
+    for r in tickers:
+        lines.append(
+            f"\n{r['ticker']} — {r['name']} | daily {r['daily']:+.2f}% | "
+            f"YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
+        )
+        if r["headlines"]:
+            lines += _fmt_headline_lines(r["headlines"], snippet_chars=300)
+        else:
+            lines.append("  (no recent company-specific headlines found)")
+
+    prompt = f"""
+You are writing the company-by-company review in a professional daily
+market review dated {_report_date()}, sent after the U.S. close. Price
+moves are today's close unless tagged "[last data ...]". Each headline
+shows its publication time.
+
+TRACKED TICKERS:
+{chr(10).join(lines)}
+
+Return JSON exactly in this shape:
+{{"tickers": {{"EL.PA": {{"note": "2-4 sentences", "cites": [1, 2]}}}}}}
+
+RULES
+- Every ticker MUST get a note, keyed by its exact ticker.
+- The company is the one named after the ticker (e.g. EL.PA is
+  EssilorLuxottica). Never describe a different company.
+- Focus on today's company-specific developments: earnings, guidance,
+  products, regulation, analyst actions, industry news. Cite headline
+  numbers from that ticker's own list.
+- If nothing is from today, say there was no fresh company-specific news
+  today; you may mention background from the last two days, labeled as such.
+- For a move of roughly 1% or more that the sources don't explain, say
+  it is unexplained by the sources reviewed. Don't infer a cause from
+  the price move alone. Never fabricate events or sources.
+"""
+    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.3,
+                        label="tickers")
+    if not parsed:
+        return {}
+
+    raw = _pick(_unwrap(parsed, ["tickers"]), "tickers", "companies")
+    if raw is None:
+        raw = parsed
+    entries = _keyed_entries(raw)
+    notes = {}
+    for r in tickers:
+        entry = entries.get(r["ticker"].upper())
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            notes[r["ticker"]] = {
+                "note": _text(_pick(entry, "note", "summary", "text")),
+                "cites": _clean_cites(_pick(entry, "cites", "sources")),
+            }
+        else:
+            notes[r["ticker"]] = {"note": _text(entry), "cites": []}
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# AI: top market stories
+# ---------------------------------------------------------------------------
+
+def _parse_stories(parsed, market_news):
+    raw = _pick(_unwrap(parsed, ["stories"]),
+                "stories", "top_stories", "market_stories")
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if not isinstance(raw, list):
+        return []
+    stories = []
+    for s in raw[:5]:
+        if not isinstance(s, dict):
+            continue
+        summary = _text(_pick(s, "summary", "body", "text", "content",
+                              "analysis", "story"))
+        if not summary:
+            continue
+        idx = _as_int_list(_pick(s, "source_index", "source", "index",
+                                 "cite", "cites"))
+        idx = idx[0] if idx else None
+        title = _text(_pick(s, "title", "headline", "name"))
+        if not title and isinstance(idx, int) and 1 <= idx <= len(market_news):
+            title = market_news[idx - 1]["title"]
+        stories.append({"title": title, "summary": summary,
+                        "source_index": idx})
+    return stories
+
+
+def build_market_story_summaries(market_news):
+    if not market_news:
+        return []
+
+    lines = []
+    for i, h in enumerate(market_news, start=1):
+        lines.append(f"[{i}] {h['title']}")
+        lines.append(f"    Publisher: {h['publisher']} | "
+                     f"Published: {fmt_published(h.get('published'))}")
+        if h.get("snippet"):
+            lines.append(f"    Summary: {h['snippet'][:700]}")
+
+    prompt = f"""
+You are writing the "Top Market Stories" section of a professional daily
+market review dated {_report_date()}, sent after the U.S. close.
+
+MARKET HEADLINES:
+{chr(10).join(lines)}
+
+Return JSON exactly in this shape:
+{{"stories": [{{"title": "headline", "summary": "150-220 words",
+  "source_index": 1}}]}}
+
+RULES
+- Pick the 3-5 most important DISTINCT stories, like tonight's front page
+  of Bloomberg, the FT or Reuters: central banks, economic data, policy,
+  geopolitics and trade, big moves in rates/currencies/commodities/credit,
+  major industry or corporate news.
+- Don't just restate today's index performance.
+- Each summary: what happened, context, why investors care, what could
+  matter next. Use only the supplied material; never invent facts.
+- source_index is the number of the headline the story is based on.
+- If there's only enough material for one or two stories, return those.
+"""
+    parsed = _groq_call(prompt, max_tokens=4000, temperature=0.3,
+                        label="stories")
+    stories = _parse_stories(parsed, market_news) if parsed else []
+    if not stories:
+        print("Stories came back empty; retrying once.")
+        parsed = _groq_call(prompt, max_tokens=4000, temperature=0.2,
+                            label="stories retry")
+        stories = _parse_stories(parsed, market_news) if parsed else []
+    return stories
+
+
+# ---------------------------------------------------------------------------
+# AI: executive summary, implications, forward view, bottom line
+# ---------------------------------------------------------------------------
+
+def _parse_overview(parsed):
+    p = _unwrap(parsed, ["executive_summary", "bottom_line"])
+    impl = _pick(p, "investment_implications", "implications") or {}
+    if not isinstance(impl, dict):
+        impl = {}
+    # Some responses put bull/bear at the top level instead.
+    bull = _pick(impl, "bull_case", "bull", "bullish") or _pick(
+        p, "bull_case", "bull")
+    bear = _pick(impl, "bear_case", "bear", "bearish") or _pick(
+        p, "bear_case", "bear")
+    key_q = _pick(impl, "key_question", "question") or _pick(
+        p, "key_question")
+    return {
+        "executive_summary": _as_text_list(
+            _pick(p, "executive_summary", "summary", "key_takeaways"), 5),
+        "investment_implications": {
+            "bull_case": _as_text_list(bull, 3),
+            "bear_case": _as_text_list(bear, 3),
+            "key_question": _text(key_q),
+        },
+        "looking_ahead": _text(_pick(p, "looking_ahead", "forward_view",
+                                     "outlook")),
+        "bottom_line": _text(_pick(p, "bottom_line", "conclusion")),
+    }
+
+
+def build_overview(indices, sectors, factors, tickers, portfolio, macro,
+                   stories, earnings_notes, upcoming, previews, macro_heads):
     portfolio_daily = calculate_weighted_portfolio_return(portfolio, "daily")
     portfolio_ytd = calculate_weighted_portfolio_return(portfolio, "ytd")
     if portfolio_daily is not None and portfolio_ytd is not None:
-        portfolio_summary = (
-            f"Weighted portfolio daily return: {portfolio_daily:+.2f}%\n"
-            f"Weighted portfolio YTD return: {portfolio_ytd:+.2f}%"
-        )
+        port = (f"Weighted portfolio: daily {portfolio_daily:+.2f}%, "
+                f"YTD {portfolio_ytd:+.2f}%")
     else:
-        portfolio_summary = (
-            "No portfolio weights supplied; use holdings-level movements only."
-        )
+        port = "No portfolio weights supplied."
+
+    story_lines = "\n".join(
+        f"- {s['title']}: {s['summary'][:350]}" for s in stories
+    ) or "(none)"
+    recap_lines = "\n".join(
+        f"- {e['company'] or e['ticker']}: {e['blurb'][:300]}"
+        for e in earnings_notes
+    ) or "(none)"
+    upcoming_lines = "\n".join(
+        f"- {e['date'].strftime('%a %b %d')} {e['timing']}: {e['ticker']} "
+        f"({e['name']}){' [TRACKED]' if e.get('tracked') else ''}"
+        + (f" — {previews[e['ticker'].upper()]['blurb'][:250]}"
+           if e["ticker"].upper() in previews else "")
+        for e in upcoming
+    ) or "(none)"
+    macro_lines = "\n".join(
+        f"- {h['title']} — {h['publisher']}" for h in macro_heads
+    ) or "(none)"
 
     prompt = f"""
-You are writing a professional daily market review for someone building
-experience for a career in wealth management and asset management.
-
-REPORT DATE: {report_date}. The review is sent after the U.S. close and
-must describe TODAY's session. All price data below is today's close
-unless tagged "[last data ...]". Every headline shows its publication
-time; treat anything published before today as background, not as
-today's news.
-
-The report should resemble a concise internal investment note:
-data first, analysis second, implications third.
-
-Respond with ONE JSON OBJECT ONLY. Do not include markdown outside the JSON.
-
-==================================================
-MARKET DATA
-==================================================
+You are writing the summary sections of a professional daily market
+review dated {_report_date()}, sent after the U.S. close, for someone
+building a career in wealth and asset management. All data is today's
+close unless tagged "[last data ...]".
 
 INDICES:
-{fmt_rows(indices)}
+{_fmt_rows(indices)}
 
 SECTORS:
-{fmt_rows(sectors, label_key="label")}
+{_fmt_rows(sectors, label_key="label")}
 
-FACTORS (long-minus-short spreads; Market is VTI's absolute return):
-{fmt_factors(factors)}
+FACTOR / STYLE ETFs:
+{_fmt_rows(factors, label_key="label")}
 
 TRACKED TICKERS:
-{fmt_tickers(tickers)}
+{_fmt_rows(tickers)}
 
-PORTFOLIO MOVEMENTS:
-{fmt_rows(portfolio)}
+PORTFOLIO:
+{_fmt_rows(portfolio)}
+{port}
 
-{portfolio_summary}
+RATES AND CROSS-ASSET:
+{_fmt_macro(macro)}
 
-==================================================
-MACRO / CROSS-ASSET
-==================================================
+TODAY'S TOP STORIES:
+{story_lines}
 
-{fmt_macro(macro)}
+EARNINGS JUST REPORTED:
+{recap_lines}
 
-==================================================
-MARKET HEADLINES
-==================================================
+EARNINGS IN THE NEXT TWO BUSINESS DAYS:
+{upcoming_lines}
 
-{fmt_news(market_news)}
+MACRO HEADLINES:
+{macro_lines}
 
-==================================================
-EARNINGS AND LOOKING AHEAD
-==================================================
-
-{fmt_earnings()}
-
-==================================================
-REQUIRED JSON
-==================================================
-
+Return JSON exactly in this shape:
 {{
-  "executive_summary": ["<bullet 1>", "<bullet 2>", "<bullet 3>",
-                        "<bullet 4>", "<bullet 5>"],
-  "tickers": {{
-    "<ticker>": {{"note": "<2-4 sentence summary>", "cites": [1, 2]}}
-  }},
-  "stories": [
-    {{"title": "<headline>", "summary": "<180-250 words>", "source_index": 1}}
-  ],
+  "executive_summary": ["bullet", "bullet", "bullet", "bullet"],
   "investment_implications": {{
-    "bull_case": ["<point>", "<point>", "<point>"],
-    "bear_case": ["<point>", "<point>", "<point>"],
-    "key_question": "<one central investment question>"
+    "bull_case": ["point", "point", "point"],
+    "bear_case": ["point", "point", "point"],
+    "key_question": "one question"
   }},
-  "looking_ahead": "<3-5 sentence forward-looking summary>",
-  "bottom_line": "<2-4 sentence final assessment>"
+  "looking_ahead": "3-5 sentences",
+  "bottom_line": "2-4 sentences"
 }}
 
-==================================================
 RULES
-==================================================
-
-EXECUTIVE SUMMARY
-- 4-5 bullets covering the most important developments across equities,
-  rates, macro, sectors, factors, earnings and cross-asset markets.
-- Each bullet should communicate a meaningful takeaway, not a list of numbers.
-- When discussing factors, interpret the spreads (e.g. "small caps
-  outperformed large caps by X pts"), not the raw ETF moves.
-
-TICKER REVIEW
-- Every tracked ticker MUST receive a summary, keyed by its exact ticker.
-- The company is the one named after the ticker (e.g. "EL.PA — EssilorLuxottica").
-  Never describe a different company that shares letters with the ticker.
-- Each ticker's headlines have already been filtered for that company. If a
-  headline is nonetheless clearly about another company, ignore it.
-- Focus on today's company-specific developments: earnings, guidance,
-  products, regulation, analyst actions, industry news.
-- Cite the relevant headline numbers from that ticker's own list.
-- If there are no headlines from today, say there was no fresh
-  company-specific news today; you may mention notable background
-  from the last two days, clearly labeled as such.
-- When a stock moves roughly 1% or more and the sources don't explain it,
-  say the move is unexplained by the sources reviewed. Do not infer a
-  cause from the price move alone.
-- Distinguish confirmed catalysts from plausible but unverified ones.
-- Do not fabricate company events, facts or sources.
-
-MARKET STORIES
-- Select 3-5 of the most important DISTINCT stories from MARKET HEADLINES,
-  like the front page of Bloomberg, the FT, CNBC or Reuters tonight.
-- Prioritize by importance and breadth of market impact: central banks,
-  economic data, policy and regulation, geopolitics and trade, big moves
-  in rates/currencies/commodities/credit, major industry or corporate news.
-- Do not simply restate today's index performance.
-- Each summary 180-250 words: what happened, context, why investors care,
-  what could matter next.
-- Use only information in the supplied results. Never invent facts.
-- source_index MUST match the numbered MARKET HEADLINES list.
-- If there isn't enough material for three stories, return fewer.
-
-INVESTMENT IMPLICATIONS
-- Bull case: strongest arguments supporting current conditions.
-- Bear case: strongest risks or challenges.
-- Key question: one specific question that should guide monitoring.
-
-LOOKING AHEAD
-- Name the most market-relevant upcoming earnings from the list (biggest
-  companies and any tracked holdings) and what to watch in each.
-- Mention macro developments only if visible in the supplied data.
-- Be concrete rather than generic.
-
-BOTTOM LINE
-- 2-4 sentences: was today constructive, mixed, or defensive, and why;
-  and the single most important thing to monitor next.
+- executive_summary: 4-5 bullets, each a meaningful takeaway across
+  equities, rates, sectors, factors, earnings and cross-asset markets,
+  not a list of numbers. Each bullet is a plain string.
+- bull_case / bear_case: the 3 strongest arguments each way, analytical
+  rather than repetitive. Each point is a plain string.
+- key_question: one specific question to guide monitoring.
+- looking_ahead: the most important upcoming earnings and macro items
+  above and what to watch in each. Be concrete.
+- bottom_line: was today constructive, mixed or defensive and why, and
+  the single most important thing to monitor next.
+- Use only the data above; don't invent facts.
 """
+    parsed = _groq_call(prompt, max_tokens=3000, temperature=0.3,
+                        label="overview")
+    result = _parse_overview(parsed) if parsed else None
 
-    parsed = _groq_call(prompt, max_tokens=8000, temperature=0.3)
+    def incomplete(r):
+        return (r is None or not r["executive_summary"]
+                or not r["investment_implications"]["bull_case"])
 
-    empty = {
+    if incomplete(result):
+        print("Overview incomplete; retrying once.")
+        parsed = _groq_call(prompt, max_tokens=3000, temperature=0.2,
+                            label="overview retry")
+        retry = _parse_overview(parsed) if parsed else None
+        if retry and (result is None or not incomplete(retry)):
+            result = retry
+
+    return result or {
         "executive_summary": [],
-        "tickers": {},
-        "stories": [],
         "investment_implications": {
             "bull_case": [], "bear_case": [], "key_question": "",
         },
         "looking_ahead": "",
         "bottom_line": "",
     }
-    if parsed is None:
-        return empty
 
-    ticker_notes = {}
-    raw_tickers = parsed.get("tickers") or {}
-    if isinstance(raw_tickers, dict):
-        for ticker, value in raw_tickers.items():
-            if isinstance(value, dict):
-                note = str(value.get("note") or "").strip()
-                cites = _clean_cites(value.get("cites"))
-            else:
-                note = value.strip() if isinstance(value, str) else ""
-                cites = []
-            ticker_notes[ticker] = {"note": note, "cites": cites}
 
-    stories = []
-    for story in (parsed.get("stories") or [])[:5]:
-        if not isinstance(story, dict):
-            continue
-        stories.append({
-            "title": str(story.get("title") or "").strip(),
-            "summary": str(story.get("summary") or "").strip(),
-            "source_index": story.get("source_index"),
-        })
-
-    impl = parsed.get("investment_implications") or {}
-    if not isinstance(impl, dict):
-        impl = {}
-
-    return {
-        "executive_summary": _clean_list(parsed.get("executive_summary"), 5),
-        "tickers": ticker_notes,
-        "stories": stories,
-        "investment_implications": {
-            "bull_case": _clean_list(impl.get("bull_case"), 3),
-            "bear_case": _clean_list(impl.get("bear_case"), 3),
-            "key_question": str(impl.get("key_question") or "").strip(),
-        },
-        "looking_ahead": str(parsed.get("looking_ahead") or "").strip(),
-        "bottom_line": str(parsed.get("bottom_line") or "").strip(),
-    }
+def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
+                     market_news, lookahead, earnings_notes, previews):
+    """
+    Runs the analysis as several smaller requests instead of one large one,
+    so a single oversized or malformed reply can't blank out the report.
+    """
+    ticker_notes = build_ticker_notes(tickers)
+    stories = build_market_story_summaries(market_news)
+    overview = build_overview(
+        indices, sectors, factors, tickers, portfolio, macro, stories,
+        earnings_notes, lookahead["earnings"], previews, lookahead["macro"],
+    )
+    return {"tickers": ticker_notes, "stories": stories, **overview}
 
 
 # ---------------------------------------------------------------------------
@@ -1697,19 +1910,9 @@ def build_labeled_table(rows, first_header="Category", second_header="Ticker"):
 
 
 def build_factor_tables(factors):
-    if not factors:
-        return "<p>Unavailable.</p>"
-    html = (
-        '<p class="note">Each factor is shown as the return of the factor ETF '
-        "minus its benchmark (long − short), so a positive number means the "
-        "factor outperformed. Market is the absolute return of VTI.</p>"
+    return build_labeled_table(
+        sorted(factors, key=lambda x: x["daily"], reverse=True)
     )
-    groups = list(dict.fromkeys(f["group"] for f in factors))
-    for group in groups:
-        rows = [f for f in factors if f["group"] == group]
-        html += f"<h3>{html_escape(group)}</h3>"
-        html += build_labeled_table(rows, "Factor", "Proxy (long − short)")
-    return html
 
 
 def build_macro_table(macro):
@@ -1882,29 +2085,36 @@ def build_earnings_recap(recent, earnings_notes):
     return html
 
 
-def build_upcoming_earnings_table(upcoming):
+def build_upcoming_earnings(upcoming, previews):
     if not upcoming:
-        return "<p>No major upcoming earnings found for the next week.</p>"
-    html = (
-        '<table class="data-table"><thead><tr>'
-        "<th>Date</th><th>Timing</th><th>Company</th><th>Ticker</th>"
-        "<th>Mkt Cap</th><th>EPS Est.</th></tr></thead><tbody>"
-    )
-    for e in upcoming:
-        name = html_escape(e["name"])
-        if e.get("tracked"):
-            name = f"<strong>{name}</strong> (tracked)"
-        html += (
-            "<tr>"
-            f'<td class="ticker">{e["date"].strftime("%a %b %d")}</td>'
-            f"<td>{html_escape(e['timing'])}</td>"
-            f'<td class="name">{name}</td>'
-            f'<td class="ticker">{html_escape(e["ticker"])}</td>'
-            f'<td class="number">{format_cap(e["market_cap"])}</td>'
-            f'<td class="number">{html_escape(e.get("eps_forecast") or "—")}</td>'
-            "</tr>"
+        return (
+            "<p>No major earnings reports scheduled for the next two "
+            "business days.</p>"
         )
-    return html + "</tbody></table>"
+    html = ""
+    for e in upcoming:
+        tracked = " — tracked holding" if e.get("tracked") else ""
+        html += '<div class="ticker-review">'
+        html += (
+            f"<h3>{html_escape(e['name'])} ({html_escape(e['ticker'])})"
+            f"{tracked}</h3>"
+        )
+        details = [f"{e['date'].strftime('%a %b %d')}, {e['timing'].lower()}"]
+        if e.get("market_cap"):
+            details.append(f"Mkt cap {format_cap(e['market_cap'])}")
+        if e.get("eps_forecast"):
+            details.append(f"Consensus EPS {e['eps_forecast']}")
+        html += f'<p class="note">{html_escape(" · ".join(details))}</p>'
+
+        preview = previews.get(e["ticker"].upper())
+        if preview:
+            html += f"<p>{html_escape(preview['blurb'])}</p>"
+            cited = _cited(e.get("headlines", []), preview["cites"])
+            html += "".join(build_source_link(h) for h in cited)
+        else:
+            html += "<p>Preview unavailable.</p>"
+        html += "</div>"
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -1956,7 +2166,7 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 
 def compose_email(indices, sectors, factors, tickers, portfolio,
                   index_portfolio, avantis_portfolio, macro, market_news,
-                  lookahead, recent_earnings, earnings_notes, ai):
+                  lookahead, recent_earnings, earnings_notes, previews, ai):
 
     now = datetime.now(MARKET_TZ).strftime("%A, %B %d, %Y")
     impl = ai.get("investment_implications", {})
@@ -2033,8 +2243,8 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 {build_paragraph(impl.get("key_question", ""))}
 
 <h1>7. Looking Ahead</h1>
-<h2>Upcoming Earnings (Next 7 Days)</h2>
-{build_upcoming_earnings_table(lookahead["earnings"])}
+<h2>Upcoming Earnings (Next Two Business Days)</h2>
+{build_upcoming_earnings(lookahead["earnings"], previews)}
 """
 
     if lookahead["macro"]:
@@ -2112,7 +2322,7 @@ def main():
 
     print("Gathering sectors and factors...")
     sectors = gather_sectors(SECTOR_ETFS)
-    factors = gather_factors(FACTOR_DEFINITIONS)
+    factors = gather_sectors(FACTOR_ETFS)
 
     print("Gathering macro data...")
     macro = gather_macro_data()
@@ -2134,6 +2344,9 @@ def main():
     print("Building earnings recap...")
     earnings_notes = build_earnings_summary(recent_earnings)
 
+    print("Building upcoming earnings previews...")
+    previews = build_earnings_previews(lookahead["earnings"])
+
     print("Building AI analysis...")
     ai = build_ai_summary(
         indices=indices,
@@ -2144,8 +2357,8 @@ def main():
         macro=macro,
         market_news=market_news,
         lookahead=lookahead,
-        recent_earnings=recent_earnings,
         earnings_notes=earnings_notes,
+        previews=previews,
     )
 
     subject = f"{REPORT_TITLE} — {market_today().strftime('%a, %b %d %Y')}"
@@ -2163,6 +2376,7 @@ def main():
         lookahead=lookahead,
         recent_earnings=recent_earnings,
         earnings_notes=earnings_notes,
+        previews=previews,
         ai=ai,
     )
 
