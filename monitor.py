@@ -1626,9 +1626,10 @@ Return JSON exactly in this shape:
   "blurb": "3-5 sentences", "cites": [1, 2]}}]}}
 
 RULES
-- One entry per listed company that has results coverage. If GENERAL
-  EARNINGS NEWS is supplied, you may add up to 3 other major companies
-  that clearly reported in the last day; their cites refer to that list.
+- Write an entry for EVERY company listed above, keyed by its exact
+  ticker. If GENERAL EARNINGS NEWS is supplied, you may add up to 3
+  other major companies that clearly reported in the last day; their
+  cites refer to that list.
 - Each blurb: EPS and revenue versus expectations, guidance, the key
   business driver(s), and the stock reaction given above.
 - For companies that reported after today's close, the after-hours move
@@ -1637,31 +1638,53 @@ RULES
   after-hours moves early or preliminary, since volume is thin and they
   can change by the next open.
 - Use only numbers and facts in the supplied material. If coverage is
-  thin, say what is known and that full details weren't available.
+  thin or missing (common for companies that reported only hours ago),
+  write 2-3 sentences from what IS supplied: the EPS result versus the
+  estimate, the surprise, and the stock reaction, and say fuller results
+  coverage wasn't yet available. Never invent revenue, guidance or
+  drivers that aren't in the material.
 - Ignore headlines not about that company's own results.
-- Skip companies with no coverage rather than guessing.
 """
-    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.2,
-                        label="earnings recap")
-    if not parsed:
-        return []
 
-    items = _pick(_unwrap(parsed, ["recent_earnings"]),
-                  "recent_earnings", "earnings", "companies")
-    out = []
-    for ticker, item in _keyed_entries(items).items():
-        if not isinstance(item, dict):
-            item = {"blurb": item}
-        blurb = _text(_pick(item, "blurb", "summary", "note", "text"))
-        if not blurb:
-            continue
-        out.append({
-            "ticker": ticker,
-            "company": _text(_pick(item, "company", "name")),
-            "blurb": blurb,
-            "cites": _clean_cites(_pick(item, "cites", "sources")),
-        })
-    return out
+    def parse(parsed):
+        items = _pick(_unwrap(parsed, ["recent_earnings"]),
+                      "recent_earnings", "earnings", "companies")
+        out = {}
+        for ticker, item in _keyed_entries(items).items():
+            if not isinstance(item, dict):
+                item = {"blurb": item}
+            blurb = _text(_pick(item, "blurb", "summary", "note", "text"))
+            if not blurb:
+                continue
+            out[ticker] = {
+                "ticker": ticker,
+                "company": _text(_pick(item, "company", "name")),
+                "blurb": blurb,
+                "cites": _clean_cites(_pick(item, "cites", "sources")),
+            }
+        return out
+
+    wanted = {c["ticker"].upper() for c in companies}
+    notes = {}
+    for attempt, temp in ((1, 0.2), (2, 0.1)):
+        parsed = _groq_call(prompt, max_tokens=4000, temperature=temp,
+                            label="earnings recap" if attempt == 1
+                            else "earnings recap retry")
+        if parsed:
+            for ticker, note in parse(parsed).items():
+                notes.setdefault(ticker, note)
+        missing = wanted - set(notes)
+        if not missing:
+            break
+        print(f"Earnings recap missing {sorted(missing)}"
+              + ("; retrying once." if attempt == 1 else "; using fallback."))
+
+    # Listed companies first, in calendar order, then any extras the
+    # model added from general earnings news.
+    ordered = [notes[c["ticker"].upper()] for c in companies
+               if c["ticker"].upper() in notes]
+    extras = [n for t, n in notes.items() if t not in wanted]
+    return ordered + extras
 
 
 # ---------------------------------------------------------------------------
@@ -2386,19 +2409,54 @@ def build_earnings_table(recent):
     return "".join(html)
 
 
+def _fallback_earnings_blurb(c):
+    """Plain-language summary from the calendar data when the AI has none."""
+    parts = []
+    actual, est = c.get("eps_actual"), c.get("eps_forecast")
+    if actual and est:
+        a, e = parse_money(actual), parse_money(est)
+        verdict = ("beat" if a > e else "missed" if a < e else "matched")
+        parts.append(f"{c['name']} reported EPS of {actual}, which "
+                     f"{verdict} the {est} consensus estimate.")
+    elif est:
+        parts.append(f"{c['name']} reported against a consensus EPS "
+                     f"estimate of {est}; the actual figure wasn't yet "
+                     "available in the data reviewed.")
+    else:
+        parts.append(f"{c['name']} reported results.")
+    if c.get("reaction") is not None:
+        if c.get("reaction_source") == "after_hours":
+            parts.append(f"Shares moved {format_pct(c['reaction'])} in "
+                         "after-hours trading, an early read on thin volume.")
+        else:
+            parts.append(f"Shares moved {format_pct(c['reaction'])} on "
+                         "the day.")
+    parts.append("Detailed results coverage wasn't available in the "
+                 "sources reviewed at the time of writing.")
+    return " ".join(parts)
+
+
 def build_earnings_recap(recent, earnings_notes):
-    if not earnings_notes:
-        if recent.get("companies"):
-            return (
-                "<p>Major companies reported, but no detailed results "
-                "coverage was available in the sources reviewed.</p>"
-            )
+    companies = recent.get("companies", [])
+    if not companies and not earnings_notes:
         return "<p>No major earnings reports since the last session.</p>"
 
-    by_ticker = {c["ticker"]: c for c in recent.get("companies", [])}
+    # Every reporting company gets a write-up: the AI's where it wrote
+    # one, otherwise a plain summary of the numbers.
+    by_note = {e["ticker"].upper(): e for e in earnings_notes}
+    entries = []
+    for c in companies:
+        note = by_note.pop(c["ticker"].upper(), None)
+        entries.append(note or {
+            "ticker": c["ticker"], "company": c["name"],
+            "blurb": _fallback_earnings_blurb(c), "cites": [],
+        })
+    entries += list(by_note.values())
+
+    by_ticker = {c["ticker"].upper(): c for c in companies}
     html = ""
-    for e in earnings_notes:
-        c = by_ticker.get(e["ticker"])
+    for e in entries:
+        c = by_ticker.get(e["ticker"].upper())
         name = (c["name"] if c else e["company"]) or e["ticker"]
         html += '<div class="ticker-review">'
         html += (
