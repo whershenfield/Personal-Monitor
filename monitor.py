@@ -90,6 +90,19 @@ UPCOMING_EARNINGS_DAYS = getattr(config, "UPCOMING_EARNINGS_DAYS", 2)
 UPCOMING_EARNINGS_LIMIT = getattr(config, "UPCOMING_EARNINGS_LIMIT", 8)
 UPCOMING_EARNINGS_MIN_CAP = getattr(config, "UPCOMING_EARNINGS_MIN_CAP", 20e9)
 
+# After-hours earnings reactions (overridable in config.py).
+# Smallest company (market cap) checked for an after-hours move.
+AFTER_HOURS_MIN_CAP = getattr(config, "AFTER_HOURS_MIN_CAP", 10e9)
+# Most rows shown in the After-Hours Earnings Movers table.
+AFTER_HOURS_LIMIT = getattr(config, "AFTER_HOURS_LIMIT", 8)
+# After-hours moves at least this large (%) always get a write-up in the
+# earnings recap, even if the company is smaller than the day's biggest
+# reporters.
+AFTER_HOURS_RECAP_MOVE = getattr(config, "AFTER_HOURS_RECAP_MOVE", 5.0)
+# Companies whose report time isn't listed only count as after-hours
+# movers above this move (%), since they may have reported before the open.
+AFTER_HOURS_UNTIMED_MOVE = getattr(config, "AFTER_HOURS_UNTIMED_MOVE", 2.0)
+
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -139,6 +152,13 @@ def fmt_published(dt):
     if not dt:
         return "time unknown"
     return dt.astimezone(MARKET_TZ).strftime("%b %d, %I:%M %p ET")
+
+
+def fmt_et_time(dt):
+    """Clock time in New York, e.g. '7:55 PM ET'."""
+    if not dt:
+        return ""
+    return dt.astimezone(MARKET_TZ).strftime("%I:%M %p ET").lstrip("0")
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +324,97 @@ def get_quote(ticker):
         if q and q["stale"]:
             print(f"WARNING: {ticker} latest data is from {q['as_of']}")
     return _QUOTE_CACHE[ticker]
+
+
+# ---------------------------------------------------------------------------
+# After-hours prices
+#
+# The report goes out around 9:30 PM ET, after the after-hours session has
+# ended (8 PM ET). For companies that report after the close, the
+# after-hours move is the market's first verdict on the results, so we
+# measure the last after-hours trade against today's regular close.
+# ---------------------------------------------------------------------------
+
+def yahoo_symbol(ticker):
+    """Nasdaq writes share classes as BRK/B or BRK.B; Yahoo uses BRK-B."""
+    return ticker.replace("/", "-").replace(".", "-")
+
+
+def get_after_hours(ticker):
+    """
+    Latest after-hours price today versus today's regular-session close.
+    Returns None if the stock didn't trade after hours today.
+    """
+    today = market_today()
+
+    close = None
+    quote = get_quote(ticker)
+    if quote and quote["as_of"] == today:
+        close = quote["price"]
+
+    price = as_of = None
+    try:
+        bars = yf.Ticker(ticker).history(
+            period="5d", interval="5m", prepost=True, auto_adjust=False
+        )
+    except Exception as e:
+        print(f"After-hours fetch failed for {ticker}: {e}")
+        bars = None
+
+    if bars is not None and not bars.empty and "Close" in bars:
+        bars = bars.dropna(subset=["Close"])
+        local = [
+            ts.tz_convert(MARKET_TZ) if ts.tzinfo else ts.tz_localize(MARKET_TZ)
+            for ts in bars.index
+        ]
+        minutes = [t.hour * 60 + t.minute for t in local]
+        on_today = [t.date() == today for t in local]
+        # Regular session: 9:30 AM to 4:00 PM. After hours: 4:00 PM onward.
+        regular_mask = [d and 570 <= m < 960 for d, m in zip(on_today, minutes)]
+        post_mask = [d and m >= 960 for d, m in zip(on_today, minutes)]
+
+        regular = bars[regular_mask]
+        post = bars[post_mask]
+        if close is None and not regular.empty:
+            close = float(regular["Close"].iloc[-1])
+        if not post.empty:
+            price = float(post["Close"].iloc[-1])
+            as_of = [t for t, keep in zip(local, post_mask) if keep][-1]
+
+    if price is None:
+        # Fallback: Yahoo's quote summary carries a post-market price.
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception:
+            info = {}
+        p, t = info.get("postMarketPrice"), info.get("postMarketTime")
+        if p and t:
+            try:
+                stamp = datetime.fromtimestamp(
+                    int(t), tz=timezone.utc
+                ).astimezone(MARKET_TZ)
+            except (TypeError, ValueError, OSError):
+                stamp = None
+            if stamp and stamp.date() == today and stamp.hour >= 16:
+                price, as_of = float(p), stamp
+
+    if price is None or not close:
+        return None
+
+    return {
+        "price": price,
+        "close": close,
+        "change": (price - close) / close * 100,
+        "as_of": as_of,
+    }
+
+
+def after_hours_label(ah):
+    """e.g. '-8.42% after hours as of 7:55 PM ET'."""
+    label = f"{format_pct(ah['change'])} after hours"
+    if ah.get("as_of"):
+        label += f" as of {fmt_et_time(ah['as_of'])}"
+    return label
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +649,7 @@ def tavily_search(query, days=1, max_results=10, depth="advanced"):
 
 
 def search_company_news(ticker, limit=5):
-    """Search the web for company-specific news from the last week."""
+    """Search the web for company-specific news from the last two days."""
     name = company_name(ticker)
     if "." in ticker or "^" in ticker:
         # Don't put exchange-suffixed tickers in the query; search engines
@@ -546,21 +657,17 @@ def search_company_news(ticker, limit=5):
         query = f'"{name}" shares company news'
     else:
         query = f'"{name}" ({ticker}) stock news'
-    return tavily_search(query, days=7, max_results=limit + 3)
+    return tavily_search(query, days=2, max_results=limit + 3)
 
 
 def gather_company_headlines(ticker, limit=5):
-    """
-    Headlines from the last week that are verifiably about this company,
-    newest first. Older items give the AI background when there's no
-    fresh news; each one carries its publication time.
-    """
+    """Recent headlines that are verifiably about this company."""
     candidates = get_headlines(ticker, limit=20) + search_company_news(
         ticker, limit=limit
     )
     relevant = [
         h for h in candidates
-        if is_recent(h, 7 * 24)
+        if is_recent(h, 48)
         and mentions_company(ticker, f"{h['title']} {h.get('snippet', '')}")
     ]
     dropped = len(candidates) - len(relevant)
@@ -586,105 +693,12 @@ def gather_group(tickers, with_headlines=False, headline_limit=5):
             row["headlines"] = gather_company_headlines(
                 ticker, limit=headline_limit
             )
-            row["benchmarks"] = gather_benchmarks(ticker)
         rows.append(row)
     return rows
 
 
-# Yahoo's sector names mapped to the sector ETF labels above.
-_YF_SECTOR_TO_LABEL = {
-    "Technology": "Information Technology",
-    "Communication Services": "Communication Services",
-    "Consumer Cyclical": "Consumer Discretionary",
-    "Industrials": "Industrials",
-    "Financial Services": "Financials",
-    "Healthcare": "Health Care",
-    "Consumer Defensive": "Consumer Staples",
-    "Energy": "Energy",
-    "Utilities": "Utilities",
-    "Real Estate": "Real Estate",
-    "Basic Materials": "Materials",
-}
-
-# Home-market index for exchange-suffixed tickers.
-_SUFFIX_INDEX = {
-    "PA": ("CAC 40", "^FCHI"),
-    "TO": ("S&P/TSX Composite", "^GSPTSE"),
-    "L": ("FTSE 100", "^FTSE"),
-    "DE": ("DAX", "^GDAXI"),
-    "AS": ("AEX", "^AEX"),
-    "SW": ("SMI", "^SSMI"),
-}
-
-# Optional overrides in config.py, e.g.
-# TICKER_BENCHMARKS = {"EL.PA": {"CAC 40": "^FCHI", "Euro Stoxx 50": "^STOXX50E"}}
-TICKER_BENCHMARKS = getattr(config, "TICKER_BENCHMARKS", {})
-
-
-def ticker_benchmarks(ticker):
-    """The market (and, for U.S. stocks, sector) to compare a stock against."""
-    if ticker in TICKER_BENCHMARKS:
-        return list(TICKER_BENCHMARKS[ticker].items())
-    if "." in ticker:
-        suffix = ticker.rsplit(".", 1)[1].upper()
-        return [_SUFFIX_INDEX[suffix]] if suffix in _SUFFIX_INDEX else []
-    out = [("S&P 500", "^GSPC")]
-    try:
-        sector = (yf.Ticker(ticker).info or {}).get("sector")
-    except Exception:
-        sector = None
-    label = _YF_SECTOR_TO_LABEL.get(sector)
-    if label and label in SECTOR_ETFS:
-        out.append((f"{label} sector", SECTOR_ETFS[label]))
-    return out
-
-
-def gather_benchmarks(ticker):
-    out = []
-    for label, symbol in ticker_benchmarks(ticker):
-        quote = get_quote(symbol)
-        if quote is None:
-            continue
-        out.append({"label": label, "ticker": symbol,
-                    "daily": quote["daily"], "stale": quote["stale"],
-                    "as_of": quote["as_of"]})
-    return out
-
-
-# Headlines about a company's results are covered in the Earnings Recap,
-# so they're kept out of Top Market Stories.
-_EARNINGS_TITLE = re.compile(
-    r"earnings|quarterly (?:results|profit|revenue|sales|loss)"
-    r"|\b(?:first|second|third|fourth)[- ]quarter "
-    r"(?:results|profit|revenue|sales|earnings|loss)"
-    r"|\bq[1-4] (?:results|earnings|profit|revenue|sales)"
-    r"|\beps\b|(?:beats?|miss(?:es)?|tops?) (?:estimates|expectations|forecasts)"
-    r"|(?:raises|cuts|lowers|reaffirms) (?:its |full-year |annual )?(?:guidance|outlook|forecast)",
-    re.IGNORECASE,
-)
-
-_OPINION_URL = re.compile(
-    r"/opinion|/commentary|/column|breakingviews|/views/|/op-?ed",
-    re.IGNORECASE,
-)
-_OPINION_TITLE = re.compile(r"^\s*(opinion|column|commentary|view)\s*[:|]",
-                            re.IGNORECASE)
-
-
-def is_earnings_story(headline):
-    return bool(_EARNINGS_TITLE.search(headline.get("title", "")))
-
-
-def looks_like_opinion(headline):
-    return bool(_OPINION_URL.search(headline.get("url", ""))
-                or _OPINION_TITLE.search(headline.get("title", "")))
-
-
-def gather_market_news(limit=14, opinion_limit=6):
-    """
-    Today's major financial-market stories, minus earnings coverage,
-    plus a separate pool of opinion and commentary pieces.
-    """
+def gather_market_news(limit=10):
+    """Search the web for today's major financial-market stories."""
     print("Gathering market news from the web...")
     today = market_today().strftime("%B %d, %Y")
 
@@ -693,51 +707,20 @@ def gather_market_news(limit=14, opinion_limit=6):
         f"Wall Street Federal Reserve interest rates inflation {today}",
         f"major business financial news investors {today}",
         f"oil gold dollar Treasury markets {today}",
-        f"economy policy trade geopolitics markets news {today}",
     ]
+
     results = []
     for query in queries:
-        results.extend(tavily_search(query, days=1, max_results=10))
+        results.extend(tavily_search(query, days=1, max_results=limit))
 
-    # Keep only stories from roughly the last day, and drop earnings.
+    # Keep only stories from roughly the last day.
     results = [h for h in results if is_recent(h, 30)]
-    dropped = [h for h in results if is_earnings_story(h)]
-    results = [h for h in results if not is_earnings_story(h)]
-    # Opinion pieces that turn up in the news search join the opinion pool.
-    found_opinion = [h for h in results if looks_like_opinion(h)]
-    results = [h for h in results if not looks_like_opinion(h)]
     results = sort_by_recency(dedupe_headlines(results))[:limit]
-    for h in results:
-        h["kind"] = "news"
 
-    opinion_queries = [
-        f"opinion column markets economy investors {today}",
-        f"commentary analysis Wall Street Fed economy columnist {today}",
-    ]
-    opinions = list(found_opinion)
-    for query in opinion_queries:
-        opinions.extend(tavily_search(query, days=2, max_results=10))
-    opinions = [h for h in opinions
-                if is_recent(h, 54) and not is_earnings_story(h)]
-    # Prefer pieces that are clearly labelled opinion; otherwise let the
-    # AI judge from the commentary search results.
-    labelled = [h for h in opinions if looks_like_opinion(h)]
-    opinions = labelled or opinions
-    titles = {h["title"].strip().lower() for h in results}
-    opinions = [h for h in sort_by_recency(dedupe_headlines(opinions))
-                if h["title"].strip().lower() not in titles][:opinion_limit]
-    for h in opinions:
-        h["kind"] = "opinion"
-
-    print(
-        f"Market news: {len(results)} stories, {len(opinions)} opinion "
-        f"candidates ({len(labelled)} clearly labelled), "
-        f"{len(dropped)} earnings headlines excluded"
-    )
-    combined = results + opinions
-    for i, r in enumerate(combined, start=1):
-        print(f"  [{i}] ({r['kind']}) {r['title']} — {r['publisher']}")
-    return combined
+    print(f"Total market news results collected: {len(results)}")
+    for i, r in enumerate(results, start=1):
+        print(f"  [{i}] {r['title']} — {r['publisher']}")
+    return results
 
 
 def gather_sectors(mapping):
@@ -953,63 +936,6 @@ def format_cap(value):
     return f"${value / 1e6:.0f}M"
 
 
-def fmt_clock(dt):
-    """'6:42 PM ET' style label for an aware datetime."""
-    if not dt:
-        return ""
-    return dt.astimezone(MARKET_TZ).strftime("%I:%M %p ET").lstrip("0")
-
-
-def _after_hours_quote(ticker, regular_close):
-    """
-    Latest after-hours (post-4:00 PM ET) price for today, and its change
-    versus today's regular-session close. Returns None if nothing has
-    traded after the close yet or the data isn't available.
-    """
-    if not regular_close or "^" in ticker:
-        return None
-    today = market_today()
-    stock = yf.Ticker(ticker)
-    price = stamp = None
-
-    # Primary source: one-minute bars including extended hours.
-    try:
-        intra = stock.history(
-            period="5d", interval="1m", prepost=True, auto_adjust=False
-        )
-    except Exception as e:
-        print(f"After-hours fetch failed for {ticker}: {e}")
-        intra = None
-    if intra is not None and not intra.empty and "Close" in intra:
-        intra = intra.dropna(subset=["Close"])
-        for ts, close in zip(intra.index, intra["Close"].tolist()):
-            local = (ts.tz_convert(MARKET_TZ) if ts.tzinfo is not None
-                     else ts.tz_localize(MARKET_TZ))
-            if local.date() == today and local.hour >= 16:
-                price, stamp = float(close), local.to_pydatetime()
-
-    # Fallback: Yahoo's quote summary, which carries a post-market price.
-    if price is None:
-        try:
-            info = stock.info or {}
-            p, t = info.get("postMarketPrice"), info.get("postMarketTime")
-            if p and t:
-                local = datetime.fromtimestamp(int(t), tz=timezone.utc)
-                local = local.astimezone(MARKET_TZ)
-                if local.date() == today and local.hour >= 16:
-                    price, stamp = float(p), local
-        except Exception:
-            pass
-
-    if price is None:
-        return None
-    return {
-        "price": price,
-        "change": (price - regular_close) / regular_close * 100,
-        "as_of": stamp,
-    }
-
-
 def fetch_earnings_calendar(day):
     """All companies reporting on a given date (Nasdaq earnings calendar)."""
     try:
@@ -1033,6 +959,7 @@ def fetch_earnings_calendar(day):
             continue
         out.append({
             "ticker": symbol,
+            "yahoo": yahoo_symbol(symbol),
             "name": str(row.get("name") or symbol).strip(),
             "date": day,
             "timing": _TIME_LABELS.get(row.get("time"), "Time n/a"),
@@ -1044,82 +971,126 @@ def fetch_earnings_calendar(day):
     return out
 
 
+def gather_after_hours_movers(today_rows):
+    """
+    After-hours move for every sizeable company that reported after
+    today's close, ranked by the size of the move.
+    """
+    pool = [
+        r for r in today_rows
+        if r["timing"] in ("After close", "Time n/a")
+        and r["market_cap"] >= AFTER_HOURS_MIN_CAP
+    ]
+    after_close_count = sum(1 for r in pool if r["timing"] == "After close")
+
+    movers = []
+    for r in pool:
+        ah = get_after_hours(r["yahoo"])
+        if ah is None:
+            if r["timing"] == "After close":
+                print(f"{r['ticker']}: no after-hours price available")
+            continue
+        # Untimed reporters may have reported before the open, so a small
+        # after-hours drift doesn't tell us anything about their results.
+        if (r["timing"] == "Time n/a"
+                and abs(ah["change"]) < AFTER_HOURS_UNTIMED_MOVE):
+            continue
+        r["after_hours"] = ah
+        movers.append(r)
+
+    movers.sort(key=lambda r: abs(r["after_hours"]["change"]), reverse=True)
+    movers = movers[:AFTER_HOURS_LIMIT]
+    print(
+        "After-hours movers: "
+        + (", ".join(f"{m['ticker']} {format_pct(m['after_hours']['change'])}"
+                     for m in movers) or "none")
+    )
+    return movers, after_close_count
+
+
 def gather_recent_earnings():
     """
-    Biggest companies that reported since the last session:
-    yesterday after the close, plus everyone reporting today.
+    Biggest companies that reported since the last session (yesterday
+    after the close, plus everyone reporting today), and the after-hours
+    reaction for companies that reported after today's close.
     """
     today = market_today()
     prev = previous_business_day(today)
 
-    candidates = []
+    pool = []
     calendar_ok = False
 
     prev_rows = fetch_earnings_calendar(prev)
     if prev_rows is not None:
         calendar_ok = True
-        candidates += [r for r in prev_rows if r["timing"] == "After close"]
+        pool += [r for r in prev_rows if r["timing"] == "After close"]
 
     today_rows = fetch_earnings_calendar(today)
     if today_rows is not None:
         calendar_ok = True
-        candidates += today_rows
+        pool += today_rows
+
+    for r in pool:
+        _EXTRA_NAMES.setdefault(r["ticker"], r["name"])
+
+    after_hours, after_close_count = gather_after_hours_movers(
+        today_rows or []
+    )
 
     candidates = [
-        c for c in candidates if c["market_cap"] >= RECENT_EARNINGS_MIN_CAP
+        c for c in pool if c["market_cap"] >= RECENT_EARNINGS_MIN_CAP
     ]
     candidates.sort(key=lambda c: c["market_cap"], reverse=True)
     candidates = list({c["ticker"]: c for c in candidates}.values())
     candidates = candidates[:RECENT_EARNINGS_LIMIT]
 
+    # Big after-hours movers always get a write-up, even if they're smaller
+    # than the day's largest reporters.
+    chosen = {c["ticker"] for c in candidates}
+    for m in after_hours:
+        if (m["ticker"] not in chosen
+                and abs(m["after_hours"]["change"]) >= AFTER_HOURS_RECAP_MOVE):
+            candidates.append(m)
+            chosen.add(m["ticker"])
+
     for c in candidates:
-        _EXTRA_NAMES.setdefault(c["ticker"], c["name"])
-        quote = get_quote(c["ticker"])
-        fresh = quote is not None and not quote["stale"]
-
-        # Regular-session move today, and any trading since the 4 PM close.
-        c["session"] = quote["daily"] if fresh else None
-        ah = _after_hours_quote(c["ticker"], quote["price"] if fresh else None)
-        c["after_hours"] = ah["change"] if ah else None
-        c["after_hours_time"] = ah["as_of"] if ah else None
-
-        reported_after_today_close = (
-            c["date"] == today and c["timing"] == "After close"
+        quote = get_quote(c["yahoo"])
+        ah = c.get("after_hours")
+        reported_today = c["date"] == today
+        regular_session = (
+            f"regular session {format_pct(quote['daily'])}"
+            if quote and not quote["stale"] else ""
         )
-        if reported_after_today_close:
-            # The session move happened before the numbers came out, so
-            # the after-hours move is the real earnings reaction.
-            c["reaction"] = c["after_hours"]
-            c["reaction_source"] = "after_hours"
-            if ah:
-                c["reaction_note"] = (
-                    f"Reported after today's close; stock "
-                    f"{format_pct(ah['change'])} in after-hours trading "
-                    f"as of {fmt_clock(ah['as_of'])} (preliminary, thin volume)"
-                )
-            else:
-                c["reaction_note"] = (
-                    "Reported after today's close; no after-hours trades "
-                    "recorded yet"
-                )
-        elif c["session"] is not None:
-            c["reaction"] = c["session"]
-            c["reaction_source"] = "session"
-            c["reaction_note"] = f"Stock {format_pct(c['session'])} today"
-            if ah:
-                c["reaction_note"] += (
-                    f", {format_pct(ah['change'])} after hours"
-                )
+
+        if reported_today and c["timing"] == "After close" and ah:
+            c["reaction"] = ah["change"]
+            c["reaction_note"] = after_hours_label(ah)
+            if regular_session:
+                c["reaction_note"] += f" ({regular_session}, before the report)"
+        elif reported_today and c["timing"] == "After close":
+            c["reaction"] = None
+            c["reaction_note"] = (
+                "Reported after today's close; after-hours price unavailable"
+            )
+        elif reported_today and ah:
+            # Report time not listed, but the stock moved after hours.
+            c["reaction"] = ah["change"]
+            c["reaction_note"] = (
+                f"Stock {format_pct(quote['daily'])} today; " if quote else ""
+            ) + after_hours_label(ah)
+        elif quote:
+            c["reaction"] = quote["daily"]
+            c["reaction_note"] = f"Stock {format_pct(quote['daily'])} today"
         else:
             c["reaction"] = None
-            c["reaction_source"] = None
             c["reaction_note"] = "Price reaction unavailable"
 
-        news = tavily_search(
-            f'"{c["name"]}" quarterly earnings results revenue guidance',
-            days=3,
-            max_results=6,
-        )
+        if ah:
+            query = (f'"{c["name"]}" earnings results guidance shares '
+                     "after-hours")
+        else:
+            query = f'"{c["name"]}" quarterly earnings results revenue guidance'
+        news = tavily_search(query, days=3, max_results=6)
         relevant = [
             h for h in news
             if mentions_company(c["ticker"], f"{h['title']} {h['snippet']}")
@@ -1141,7 +1112,12 @@ def gather_recent_earnings():
         f"Recent earnings: {len(candidates)} companies "
         f"(calendar {'ok' if calendar_ok else 'unavailable'})"
     )
-    return {"companies": candidates, "general": general}
+    return {
+        "companies": candidates,
+        "general": general,
+        "after_hours": after_hours,
+        "after_close_count": after_close_count,
+    }
 
 
 def extract_earnings_dates(calendar):
@@ -1578,6 +1554,22 @@ def _fmt_macro(m):
     return "\n".join(lines) or "(no macro data)"
 
 
+def _fmt_after_hours(movers):
+    lines = []
+    for m in movers:
+        ah = m["after_hours"]
+        eps = ""
+        if m.get("eps_actual") and m.get("eps_forecast"):
+            eps = f" | EPS {m['eps_actual']} vs. {m['eps_forecast']} est."
+        untimed = " [report time not listed]" if m["timing"] == "Time n/a" else ""
+        lines.append(
+            f"- {m['ticker']} ({m['name']}): {after_hours_label(ah)} "
+            f"(close {ah['close']:.2f}, after hours {ah['price']:.2f}){eps}"
+            f"{untimed}"
+        )
+    return "\n".join(lines) or "(none)"
+
+
 def _report_date():
     return market_today().strftime("%A, %B %d, %Y")
 
@@ -1615,9 +1607,10 @@ def build_earnings_summary(recent):
 
     prompt = f"""
 You are writing the earnings recap section of a professional daily market
-review dated {_report_date()}, delivered after the U.S. close.
+review dated {_report_date()}, delivered around 9:30 PM ET, after both the
+U.S. close and the after-hours session.
 
-COMPANIES THAT REPORTED (largest first):
+COMPANIES THAT REPORTED (largest first, plus any big after-hours movers):
 {chr(10).join(lines) if lines else "(none from calendar)"}
 {general_block}
 
@@ -1626,65 +1619,42 @@ Return JSON exactly in this shape:
   "blurb": "3-5 sentences", "cites": [1, 2]}}]}}
 
 RULES
-- Write an entry for EVERY company listed above, keyed by its exact
-  ticker. If GENERAL EARNINGS NEWS is supplied, you may add up to 3
-  other major companies that clearly reported in the last day; their
-  cites refer to that list.
+- One entry per listed company that has results coverage. If GENERAL
+  EARNINGS NEWS is supplied, you may add up to 3 other major companies
+  that clearly reported in the last day; their cites refer to that list.
 - Each blurb: EPS and revenue versus expectations, guidance, the key
   business driver(s), and the stock reaction given above.
 - For companies that reported after today's close, the after-hours move
-  is the earnings reaction; today's regular-session move happened before
-  the results and should not be described as a reaction to them. Call
-  after-hours moves early or preliminary, since volume is thin and they
-  can change by the next open.
+  given above IS the market's reaction. Explain it with the results (for
+  example, a beat overshadowed by weak guidance) where the sources support
+  that, and call it an after-hours move. Their regular-session move came
+  before the report, so never present it as a reaction to the results.
 - Use only numbers and facts in the supplied material. If coverage is
-  thin or missing (common for companies that reported only hours ago),
-  write 2-3 sentences from what IS supplied: the EPS result versus the
-  estimate, the surprise, and the stock reaction, and say fuller results
-  coverage wasn't yet available. Never invent revenue, guidance or
-  drivers that aren't in the material.
+  thin, say what is known and that full details weren't available.
 - Ignore headlines not about that company's own results.
+- Skip companies with no coverage rather than guessing.
 """
+    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.2,
+                        label="earnings recap")
+    if not parsed:
+        return []
 
-    def parse(parsed):
-        items = _pick(_unwrap(parsed, ["recent_earnings"]),
-                      "recent_earnings", "earnings", "companies")
-        out = {}
-        for ticker, item in _keyed_entries(items).items():
-            if not isinstance(item, dict):
-                item = {"blurb": item}
-            blurb = _text(_pick(item, "blurb", "summary", "note", "text"))
-            if not blurb:
-                continue
-            out[ticker] = {
-                "ticker": ticker,
-                "company": _text(_pick(item, "company", "name")),
-                "blurb": blurb,
-                "cites": _clean_cites(_pick(item, "cites", "sources")),
-            }
-        return out
-
-    wanted = {c["ticker"].upper() for c in companies}
-    notes = {}
-    for attempt, temp in ((1, 0.2), (2, 0.1)):
-        parsed = _groq_call(prompt, max_tokens=4000, temperature=temp,
-                            label="earnings recap" if attempt == 1
-                            else "earnings recap retry")
-        if parsed:
-            for ticker, note in parse(parsed).items():
-                notes.setdefault(ticker, note)
-        missing = wanted - set(notes)
-        if not missing:
-            break
-        print(f"Earnings recap missing {sorted(missing)}"
-              + ("; retrying once." if attempt == 1 else "; using fallback."))
-
-    # Listed companies first, in calendar order, then any extras the
-    # model added from general earnings news.
-    ordered = [notes[c["ticker"].upper()] for c in companies
-               if c["ticker"].upper() in notes]
-    extras = [n for t, n in notes.items() if t not in wanted]
-    return ordered + extras
+    items = _pick(_unwrap(parsed, ["recent_earnings"]),
+                  "recent_earnings", "earnings", "companies")
+    out = []
+    for ticker, item in _keyed_entries(items).items():
+        if not isinstance(item, dict):
+            item = {"blurb": item}
+        blurb = _text(_pick(item, "blurb", "summary", "note", "text"))
+        if not blurb:
+            continue
+        out.append({
+            "ticker": ticker,
+            "company": _text(_pick(item, "company", "name")),
+            "blurb": blurb,
+            "cites": _clean_cites(_pick(item, "cites", "sources")),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1767,12 +1737,6 @@ def build_ticker_notes(tickers):
             f"\n{r['ticker']} — {r['name']} | daily {r['daily']:+.2f}% | "
             f"YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
         )
-        bench = r.get("benchmarks") or []
-        if bench:
-            lines.append("  Benchmarks today: " + "; ".join(
-                f"{b['label']} ({b['ticker']}) {b['daily']:+.2f}%{_stale_tag(b)}"
-                for b in bench
-            ))
         if r["headlines"]:
             lines += _fmt_headline_lines(r["headlines"], snippet_chars=300)
         else:
@@ -1781,9 +1745,8 @@ def build_ticker_notes(tickers):
     prompt = f"""
 You are writing the company-by-company review in a professional daily
 market review dated {_report_date()}, sent after the U.S. close. Price
-moves are today's close unless tagged "[last data ...]". Each ticker
-shows how its market and sector benchmarks moved today, and each
-headline shows its publication time (up to a week back).
+moves are today's close unless tagged "[last data ...]". Each headline
+shows its publication time.
 
 TRACKED TICKERS:
 {chr(10).join(lines)}
@@ -1799,17 +1762,10 @@ RULES
   products, regulation, analyst actions, industry news. Cite headline
   numbers from that ticker's own list.
 - If nothing is from today, say there was no fresh company-specific news
-  today. Recent headlines from earlier in the week (for example, Friday's
-  news in a Monday report) are useful background: use them, and say when
-  they were published.
-- Always explain the move relative to its benchmarks. If the stock moved
-  roughly in line with its market or sector (within about 1 percentage
-  point), say it moved with the market or sector; that is an explanation,
-  not an unexplained move.
-- Only if the stock diverged from its benchmarks by roughly 1 point or
-  more and no headline accounts for it, say the divergence is unexplained
-  by the sources reviewed. Don't invent a company-specific cause from the
-  price move alone. Never fabricate events or sources.
+  today; you may mention background from the last two days, labeled as such.
+- For a move of roughly 1% or more that the sources don't explain, say
+  it is unexplained by the sources reviewed. Don't infer a cause from
+  the price move alone. Never fabricate events or sources.
 """
     parsed = _groq_call(prompt, max_tokens=3500, temperature=0.3,
                         label="tickers")
@@ -1847,7 +1803,7 @@ def _parse_stories(parsed, market_news):
     if not isinstance(raw, list):
         return []
     stories = []
-    for s in raw[:8]:
+    for s in raw[:5]:
         if not isinstance(s, dict):
             continue
         summary = _text(_pick(s, "summary", "body", "text", "content",
@@ -1857,106 +1813,58 @@ def _parse_stories(parsed, market_news):
         idx = _as_int_list(_pick(s, "source_index", "source", "index",
                                  "cite", "cites"))
         idx = idx[0] if idx else None
-        valid = isinstance(idx, int) and 1 <= idx <= len(market_news)
         title = _text(_pick(s, "title", "headline", "name"))
-        if not title and valid:
+        if not title and isinstance(idx, int) and 1 <= idx <= len(market_news):
             title = market_news[idx - 1]["title"]
-        # The source list decides what's opinion, not the model's label.
-        kind = market_news[idx - 1].get("kind", "news") if valid else "news"
-        source_title = market_news[idx - 1]["title"] if valid else ""
-        if kind != "opinion" and (
-                is_earnings_story({"title": title})
-                or is_earnings_story({"title": source_title})):
-            print(f"Dropping earnings story from Top Stories: {title}")
-            continue
         stories.append({"title": title, "summary": summary,
-                        "source_index": idx, "kind": kind})
-
-    # Exactly one opinion piece, listed last.
-    news = [s for s in stories if s["kind"] != "opinion"]
-    opinion = [s for s in stories if s["kind"] == "opinion"][:1]
-    return news[:4] + opinion
-
-
-def _stories_complete(stories, market_news):
-    """Five stories with one opinion piece, when the sources allow it."""
-    have_opinion = any(h.get("kind") == "opinion" for h in market_news)
-    news_available = sum(1 for h in market_news if h.get("kind") != "opinion")
-    want_news = min(4, news_available)
-    got_news = sum(1 for s in stories if s["kind"] != "opinion")
-    got_opinion = any(s["kind"] == "opinion" for s in stories)
-    return got_news >= want_news and (got_opinion or not have_opinion)
+                        "source_index": idx})
+    return stories
 
 
 def build_market_story_summaries(market_news):
     if not market_news:
         return []
 
-    def block(kind):
-        out = []
-        for i, h in enumerate(market_news, start=1):
-            if h.get("kind", "news") != kind:
-                continue
-            out.append(f"[{i}] {h['title']}")
-            out.append(f"    Publisher: {h['publisher']} | "
-                       f"Published: {fmt_published(h.get('published'))} | "
-                       f"URL: {h.get('url', '')}")
-            if h.get("snippet"):
-                out.append(f"    Summary: {h['snippet'][:700]}")
-        return "\n".join(out) or "(none)"
+    lines = []
+    for i, h in enumerate(market_news, start=1):
+        lines.append(f"[{i}] {h['title']}")
+        lines.append(f"    Publisher: {h['publisher']} | "
+                     f"Published: {fmt_published(h.get('published'))}")
+        if h.get("snippet"):
+            lines.append(f"    Summary: {h['snippet'][:700]}")
 
     prompt = f"""
 You are writing the "Top Market Stories" section of a professional daily
 market review dated {_report_date()}, sent after the U.S. close.
 
-NEWS HEADLINES:
-{block("news")}
-
-OPINION AND COMMENTARY CANDIDATES:
-{block("opinion")}
+MARKET HEADLINES:
+{chr(10).join(lines)}
 
 Return JSON exactly in this shape:
 {{"stories": [{{"title": "headline", "summary": "150-220 words",
   "source_index": 1}}]}}
 
 RULES
-- Return exactly 5 entries: 4 news stories followed by 1 opinion piece.
-- News stories: the 4 most important DISTINCT stories from NEWS
-  HEADLINES, like tonight's front page of Bloomberg, the FT or Reuters:
-  central banks, economic data, policy, geopolitics and trade, big moves
-  in rates/currencies/commodities/credit, major industry or corporate news.
-- NO earnings stories. Skip anything about a company's quarterly results,
-  EPS, revenue versus estimates, guidance, or an upcoming report, even if
-  it seems important. Earnings are covered elsewhere in the review.
+- Pick the 4-5 most important DISTINCT stories, like tonight's front page
+  of Bloomberg, the FT or Reuters: central banks, economic data, policy,
+  geopolitics and trade, big moves in rates/currencies/commodities/credit,
+  major industry or corporate news.
 - Don't just restate today's index performance.
-- Each news summary: what happened, context, why investors care, what
-  could matter next.
-- Opinion piece: choose the single most thoughtful markets or economics
-  opinion, column or commentary piece from OPINION AND COMMENTARY
-  CANDIDATES. It must be an argument from a columnist or commentator,
-  not a straight news report, and not about earnings. Its summary states
-  the author's argument and evidence, attributes it to them ("the
-  columnist argues..."), and closes with the strongest counterpoint or
-  what would prove it wrong. Never present the author's view as fact.
-- source_index is the number of the item the entry is based on.
-- Use only the supplied material; never invent facts, authors or quotes.
-- If no candidate is genuinely an opinion piece, return only the 4 news
-  stories. If there are fewer than 4 distinct non-earnings news stories,
-  return those you have.
+- Each summary: what happened, context, why investors care, what could
+  matter next. Use only the supplied material; never invent facts.
+- source_index is the number of the headline the story is based on.
+- Don't pick stories that exclusively discuss a certain company's
+  upcoming/previous earnings report.
+- If there's only enough material for one or two stories, return those.
 """
-    stories = []
-    for attempt, temp in ((1, 0.3), (2, 0.2)):
-        parsed = _groq_call(prompt, max_tokens=4500, temperature=temp,
-                            label="stories" if attempt == 1
-                            else "stories retry")
-        result = _parse_stories(parsed, market_news) if parsed else []
-        if (_stories_complete(result, market_news)
-                or len(result) > len(stories)):
-            stories = result
-        if _stories_complete(stories, market_news):
-            break
-        print(f"Stories incomplete ({len(stories)} returned); "
-              + ("retrying once." if attempt == 1 else "keeping best."))
+    parsed = _groq_call(prompt, max_tokens=4000, temperature=0.3,
+                        label="stories")
+    stories = _parse_stories(parsed, market_news) if parsed else []
+    if not stories:
+        print("Stories came back empty; retrying once.")
+        parsed = _groq_call(prompt, max_tokens=4000, temperature=0.2,
+                            label="stories retry")
+        stories = _parse_stories(parsed, market_news) if parsed else []
     return stories
 
 
@@ -1991,7 +1899,8 @@ def _parse_overview(parsed):
 
 
 def build_overview(indices, sectors, factors, tickers, portfolio, macro,
-                   stories, earnings_notes, upcoming, previews, macro_heads):
+                   stories, earnings_notes, upcoming, previews, macro_heads,
+                   after_hours=None):
     portfolio_daily = calculate_weighted_portfolio_return(portfolio, "daily")
     portfolio_ytd = calculate_weighted_portfolio_return(portfolio, "ytd")
     if portfolio_daily is not None and portfolio_ytd is not None:
@@ -2001,8 +1910,7 @@ def build_overview(indices, sectors, factors, tickers, portfolio, macro,
         port = "No portfolio weights supplied."
 
     story_lines = "\n".join(
-        f"- {'[OPINION — a columnist view, not fact] ' if s.get('kind') == 'opinion' else ''}"
-        f"{s['title']}: {s['summary'][:350]}" for s in stories
+        f"- {s['title']}: {s['summary'][:350]}" for s in stories
     ) or "(none)"
     recap_lines = "\n".join(
         f"- {e['company'] or e['ticker']}: {e['blurb'][:300]}"
@@ -2021,9 +1929,9 @@ def build_overview(indices, sectors, factors, tickers, portfolio, macro,
 
     prompt = f"""
 You are writing the summary sections of a professional daily market
-review dated {_report_date()}, sent after the U.S. close, for someone
+review dated {_report_date()}, sent around 9:30 PM ET for someone
 building a career in wealth and asset management. All data is today's
-close unless tagged "[last data ...]".
+close unless tagged "[last data ...]" or labeled as after hours.
 
 INDICES:
 {_fmt_rows(indices)}
@@ -2050,6 +1958,10 @@ TODAY'S TOP STORIES:
 EARNINGS JUST REPORTED:
 {recap_lines}
 
+AFTER-HOURS EARNINGS REACTIONS (companies that reported after today's
+close; move versus today's closing price, from thin after-hours trading):
+{_fmt_after_hours(after_hours or [])}
+
 EARNINGS IN THE NEXT TWO BUSINESS DAYS:
 {upcoming_lines}
 
@@ -2072,13 +1984,20 @@ RULES
 - executive_summary: 4-5 bullets, each a meaningful takeaway across
   equities, rates, sectors, factors, earnings and cross-asset markets,
   not a list of numbers. Each bullet is a plain string.
+- After-hours reactions: if any move above is roughly 3% or larger, one
+  executive_summary bullet must cover the biggest one(s): what drove it
+  and what it signals for tomorrow's open, including for the company's
+  sector or peers where relevant. Always call these after-hours moves,
+  never closing prices, and note they come from thin trading.
 - bull_case / bear_case: the 3 strongest arguments each way, analytical
   rather than repetitive. Each point is a plain string.
 - key_question: one specific question to guide monitoring.
 - looking_ahead: the most important upcoming earnings and macro items
   above and what to watch in each. Be concrete.
 - bottom_line: was today constructive, mixed or defensive and why, and
-  the single most important thing to monitor next.
+  the single most important thing to monitor next. If a large
+  after-hours earnings move could set the tone for tomorrow's open,
+  say so.
 - Use only the data above; don't invent facts.
 """
     parsed = _groq_call(prompt, max_tokens=3000, temperature=0.3,
@@ -2108,7 +2027,8 @@ RULES
 
 
 def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
-                     market_news, lookahead, earnings_notes, previews):
+                     market_news, lookahead, earnings_notes, previews,
+                     after_hours=None):
     """
     Runs the analysis as several smaller requests instead of one large one,
     so a single oversized or malformed reply can't blank out the report.
@@ -2118,6 +2038,7 @@ def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
     overview = build_overview(
         indices, sectors, factors, tickers, portfolio, macro, stories,
         earnings_notes, lookahead["earnings"], previews, lookahead["macro"],
+        after_hours=after_hours,
     )
     return {"tickers": ticker_notes, "stories": stories, **overview}
 
@@ -2143,6 +2064,7 @@ def format_pct(value):
 
 
 STALE_MARK = "†"
+UNTIMED_MARK = "‡"
 
 
 def stale_footnote(rows):
@@ -2218,6 +2140,61 @@ def build_factor_tables(factors):
     return build_labeled_table(
         sorted(factors, key=lambda x: x["daily"], reverse=True)
     )
+
+
+def build_after_hours_movers(recent):
+    """Table of after-close reporters ranked by their after-hours move."""
+    movers = recent.get("after_hours", [])
+    if not movers:
+        if recent.get("after_close_count"):
+            return (
+                "<h2>After-Hours Earnings Movers</h2>"
+                "<p>Major companies reported after the close, but "
+                "after-hours prices weren't available.</p>"
+            )
+        return ""
+
+    html = [
+        "<h2>After-Hours Earnings Movers</h2>"
+        '<table class="data-table"><thead><tr>'
+        "<th>Ticker</th><th>Company</th><th>EPS vs. Est.</th>"
+        "<th>Close</th><th>After Hours</th><th>Change</th><th>As of</th>"
+        "</tr></thead><tbody>"
+    ]
+    for m in movers:
+        ah = m["after_hours"]
+        mark = UNTIMED_MARK if m["timing"] == "Time n/a" else ""
+        if m.get("eps_actual") and m.get("eps_forecast"):
+            eps = f"{m['eps_actual']} vs. {m['eps_forecast']}"
+        else:
+            eps = "—"
+        html.append(
+            "<tr>"
+            f'<td class="ticker">{html_escape(m["ticker"])}{mark}</td>'
+            f'<td class="name">{html_escape(m["name"])}</td>'
+            f'<td class="number">{html_escape(eps)}</td>'
+            f'<td class="number">{ah["close"]:.2f}</td>'
+            f'<td class="number">{ah["price"]:.2f}</td>'
+            f'<td class="number {pct_class(ah["change"])}">'
+            f'<strong>{format_pct(ah["change"])}</strong></td>'
+            f'<td class="number">{html_escape(fmt_et_time(ah.get("as_of")))}</td>'
+            "</tr>"
+        )
+    html.append("</tbody></table>")
+
+    notes = (
+        "Companies that reported after today's close, ranked by the size of "
+        "the after-hours move versus today's closing price. After-hours "
+        "trading is thin, so these prices are indicative and can shift by "
+        "the open. Full write-ups are in the Earnings Recap."
+    )
+    if any(m["timing"] == "Time n/a" for m in movers):
+        notes += (
+            f" {UNTIMED_MARK} Report time not listed; included because the "
+            "stock moved after hours."
+        )
+    html.append(f'<p class="note">{html_escape(notes)}</p>')
+    return "".join(html)
 
 
 def build_macro_table(macro):
@@ -2338,13 +2315,8 @@ def build_market_stories(market_news, ai):
         return "<p>Unavailable.</p>"
     html = ""
     for story in stories:
-        title = str(story.get("title") or "").strip()
-        if story.get("kind") == "opinion":
-            title = _OPINION_TITLE.sub("", title).strip()
-        title = html_escape(title)
-        if story.get("kind") == "opinion":
-            html += f"<h2>Opinion: {title}</h2>" if title else "<h2>Opinion</h2>"
-        elif title:
+        title = html_escape(str(story.get("title") or "").strip())
+        if title:
             html += f"<h2>{title}</h2>"
         idx = story.get("source_index")
         if isinstance(idx, int) and 1 <= idx <= len(market_news):
@@ -2353,110 +2325,19 @@ def build_market_stories(market_news, ai):
     return html
 
 
-def build_earnings_table(recent):
-    """
-    At-a-glance table of everyone who just reported, with the regular
-    session move and the after-hours move side by side. The figure that
-    reflects the earnings reaction is bolded.
-    """
-    companies = recent.get("companies", [])
-    if not companies:
-        return ""
-
-    def pct_cell(value, is_reaction):
-        if value is None:
-            return '<td class="number">—</td>'
-        cls = pct_class(value) + (" reaction" if is_reaction else "")
-        return f'<td class="number {cls}">{format_pct(value)}</td>'
-
-    html = [
-        '<table class="data-table"><thead><tr>'
-        "<th>Company</th><th>Reported</th><th>EPS vs. Est.</th>"
-        "<th>Today's Session</th><th>After Hours</th>"
-        "</tr></thead><tbody>"
-    ]
-    for c in companies:
-        if c.get("eps_actual") and c.get("eps_forecast"):
-            eps = f"{c['eps_actual']} vs. {c['eps_forecast']}"
-        elif c.get("eps_forecast"):
-            eps = f"Est. {c['eps_forecast']}"
-        else:
-            eps = "—"
-        source = c.get("reaction_source")
-        html.append(
-            "<tr>"
-            f'<td class="name">{html_escape(c["name"])} '
-            f'<span class="ticker">({html_escape(c["ticker"])})</span></td>'
-            f'<td>{html_escape(c["date"].strftime("%b %d"))}, '
-            f'{html_escape(c["timing"].lower())}</td>'
-            f'<td class="number">{html_escape(eps)}</td>'
-            + pct_cell(c.get("session"), source == "session")
-            + pct_cell(c.get("after_hours"), source == "after_hours")
-            + "</tr>"
-        )
-    html.append("</tbody></table>")
-
-    stamps = [c["after_hours_time"] for c in companies
-              if c.get("after_hours_time")]
-    as_of = f" After-hours prices as of {fmt_clock(max(stamps))}." if stamps else ""
-    html.append(
-        '<p class="note">Bold marks the earnings reaction: today\'s session '
-        "for companies that reported before today's open or after "
-        "yesterday's close, and after-hours trading for companies that "
-        f"reported after today's close.{as_of} After-hours moves trade on "
-        "thin volume and can shift meaningfully by the next open.</p>"
-    )
-    return "".join(html)
-
-
-def _fallback_earnings_blurb(c):
-    """Plain-language summary from the calendar data when the AI has none."""
-    parts = []
-    actual, est = c.get("eps_actual"), c.get("eps_forecast")
-    if actual and est:
-        a, e = parse_money(actual), parse_money(est)
-        verdict = ("beat" if a > e else "missed" if a < e else "matched")
-        parts.append(f"{c['name']} reported EPS of {actual}, which "
-                     f"{verdict} the {est} consensus estimate.")
-    elif est:
-        parts.append(f"{c['name']} reported against a consensus EPS "
-                     f"estimate of {est}; the actual figure wasn't yet "
-                     "available in the data reviewed.")
-    else:
-        parts.append(f"{c['name']} reported results.")
-    if c.get("reaction") is not None:
-        if c.get("reaction_source") == "after_hours":
-            parts.append(f"Shares moved {format_pct(c['reaction'])} in "
-                         "after-hours trading, an early read on thin volume.")
-        else:
-            parts.append(f"Shares moved {format_pct(c['reaction'])} on "
-                         "the day.")
-    parts.append("Detailed results coverage wasn't available in the "
-                 "sources reviewed at the time of writing.")
-    return " ".join(parts)
-
-
 def build_earnings_recap(recent, earnings_notes):
-    companies = recent.get("companies", [])
-    if not companies and not earnings_notes:
+    if not earnings_notes:
+        if recent.get("companies"):
+            return (
+                "<p>Major companies reported, but no detailed results "
+                "coverage was available in the sources reviewed.</p>"
+            )
         return "<p>No major earnings reports since the last session.</p>"
 
-    # Every reporting company gets a write-up: the AI's where it wrote
-    # one, otherwise a plain summary of the numbers.
-    by_note = {e["ticker"].upper(): e for e in earnings_notes}
-    entries = []
-    for c in companies:
-        note = by_note.pop(c["ticker"].upper(), None)
-        entries.append(note or {
-            "ticker": c["ticker"], "company": c["name"],
-            "blurb": _fallback_earnings_blurb(c), "cites": [],
-        })
-    entries += list(by_note.values())
-
-    by_ticker = {c["ticker"].upper(): c for c in companies}
+    by_ticker = {c["ticker"]: c for c in recent.get("companies", [])}
     html = ""
-    for e in entries:
-        c = by_ticker.get(e["ticker"].upper())
+    for e in earnings_notes:
+        c = by_ticker.get(e["ticker"])
         name = (c["name"] if c else e["company"]) or e["ticker"]
         html += '<div class="ticker-review">'
         html += (
@@ -2553,7 +2434,6 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
                     overflow-wrap: break-word; }
 .data-table .number { text-align: right; white-space: nowrap;
                       font-variant-numeric: tabular-nums; }
-.data-table .reaction { font-weight: bold; }
 .positive { color: #008000; }
 .negative { color: #b00000; }
 .neutral { color: #000; }
@@ -2582,6 +2462,7 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 
 <h1>1. Executive Summary</h1>
 {build_bullet_list(ai.get("executive_summary", []))}
+{build_after_hours_movers(recent_earnings)}
 
 <h1>2. Market Dashboard</h1>
 
@@ -2634,7 +2515,6 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 {build_market_stories(market_news, ai)}
 
 <h1>5. Earnings Recap</h1>
-{build_earnings_table(recent_earnings)}
 {build_earnings_recap(recent_earnings, earnings_notes)}
 
 <h1>6. Investment Implications</h1>
@@ -2731,9 +2611,9 @@ def main():
     macro = gather_macro_data()
 
     print("Gathering market headlines...")
-    market_news = gather_market_news()
+    market_news = gather_market_news(limit=10)
 
-    print("Gathering recent earnings...")
+    print("Gathering recent earnings and after-hours moves...")
     recent_earnings = gather_recent_earnings()
 
     print("Gathering lookahead...")
@@ -2762,6 +2642,7 @@ def main():
         lookahead=lookahead,
         earnings_notes=earnings_notes,
         previews=previews,
+        after_hours=recent_earnings.get("after_hours", []),
     )
 
     subject = f"{REPORT_TITLE} — {market_today().strftime('%a, %b %d %Y')}"
