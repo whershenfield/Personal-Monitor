@@ -538,7 +538,7 @@ def tavily_search(query, days=1, max_results=10, depth="advanced"):
 
 
 def search_company_news(ticker, limit=5):
-    """Search the web for company-specific news from the last two days."""
+    """Search the web for company-specific news from the last week."""
     name = company_name(ticker)
     if "." in ticker or "^" in ticker:
         # Don't put exchange-suffixed tickers in the query; search engines
@@ -546,17 +546,21 @@ def search_company_news(ticker, limit=5):
         query = f'"{name}" shares company news'
     else:
         query = f'"{name}" ({ticker}) stock news'
-    return tavily_search(query, days=2, max_results=limit + 3)
+    return tavily_search(query, days=7, max_results=limit + 3)
 
 
 def gather_company_headlines(ticker, limit=5):
-    """Recent headlines that are verifiably about this company."""
+    """
+    Headlines from the last week that are verifiably about this company,
+    newest first. Older items give the AI background when there's no
+    fresh news; each one carries its publication time.
+    """
     candidates = get_headlines(ticker, limit=20) + search_company_news(
         ticker, limit=limit
     )
     relevant = [
         h for h in candidates
-        if is_recent(h, 48)
+        if is_recent(h, 7 * 24)
         and mentions_company(ticker, f"{h['title']} {h.get('snippet', '')}")
     ]
     dropped = len(candidates) - len(relevant)
@@ -582,12 +586,105 @@ def gather_group(tickers, with_headlines=False, headline_limit=5):
             row["headlines"] = gather_company_headlines(
                 ticker, limit=headline_limit
             )
+            row["benchmarks"] = gather_benchmarks(ticker)
         rows.append(row)
     return rows
 
 
-def gather_market_news(limit=10):
-    """Search the web for today's major financial-market stories."""
+# Yahoo's sector names mapped to the sector ETF labels above.
+_YF_SECTOR_TO_LABEL = {
+    "Technology": "Information Technology",
+    "Communication Services": "Communication Services",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Industrials": "Industrials",
+    "Financial Services": "Financials",
+    "Healthcare": "Health Care",
+    "Consumer Defensive": "Consumer Staples",
+    "Energy": "Energy",
+    "Utilities": "Utilities",
+    "Real Estate": "Real Estate",
+    "Basic Materials": "Materials",
+}
+
+# Home-market index for exchange-suffixed tickers.
+_SUFFIX_INDEX = {
+    "PA": ("CAC 40", "^FCHI"),
+    "TO": ("S&P/TSX Composite", "^GSPTSE"),
+    "L": ("FTSE 100", "^FTSE"),
+    "DE": ("DAX", "^GDAXI"),
+    "AS": ("AEX", "^AEX"),
+    "SW": ("SMI", "^SSMI"),
+}
+
+# Optional overrides in config.py, e.g.
+# TICKER_BENCHMARKS = {"EL.PA": {"CAC 40": "^FCHI", "Euro Stoxx 50": "^STOXX50E"}}
+TICKER_BENCHMARKS = getattr(config, "TICKER_BENCHMARKS", {})
+
+
+def ticker_benchmarks(ticker):
+    """The market (and, for U.S. stocks, sector) to compare a stock against."""
+    if ticker in TICKER_BENCHMARKS:
+        return list(TICKER_BENCHMARKS[ticker].items())
+    if "." in ticker:
+        suffix = ticker.rsplit(".", 1)[1].upper()
+        return [_SUFFIX_INDEX[suffix]] if suffix in _SUFFIX_INDEX else []
+    out = [("S&P 500", "^GSPC")]
+    try:
+        sector = (yf.Ticker(ticker).info or {}).get("sector")
+    except Exception:
+        sector = None
+    label = _YF_SECTOR_TO_LABEL.get(sector)
+    if label and label in SECTOR_ETFS:
+        out.append((f"{label} sector", SECTOR_ETFS[label]))
+    return out
+
+
+def gather_benchmarks(ticker):
+    out = []
+    for label, symbol in ticker_benchmarks(ticker):
+        quote = get_quote(symbol)
+        if quote is None:
+            continue
+        out.append({"label": label, "ticker": symbol,
+                    "daily": quote["daily"], "stale": quote["stale"],
+                    "as_of": quote["as_of"]})
+    return out
+
+
+# Headlines about a company's results are covered in the Earnings Recap,
+# so they're kept out of Top Market Stories.
+_EARNINGS_TITLE = re.compile(
+    r"earnings|quarterly (?:results|profit|revenue|sales|loss)"
+    r"|\b(?:first|second|third|fourth)[- ]quarter "
+    r"(?:results|profit|revenue|sales|earnings|loss)"
+    r"|\bq[1-4] (?:results|earnings|profit|revenue|sales)"
+    r"|\beps\b|(?:beats?|miss(?:es)?|tops?) (?:estimates|expectations|forecasts)"
+    r"|(?:raises|cuts|lowers|reaffirms) (?:its |full-year |annual )?(?:guidance|outlook|forecast)",
+    re.IGNORECASE,
+)
+
+_OPINION_URL = re.compile(
+    r"/opinion|/commentary|/column|breakingviews|/views/|/op-?ed",
+    re.IGNORECASE,
+)
+_OPINION_TITLE = re.compile(r"^\s*(opinion|column|commentary|view)\s*[:|]",
+                            re.IGNORECASE)
+
+
+def is_earnings_story(headline):
+    return bool(_EARNINGS_TITLE.search(headline.get("title", "")))
+
+
+def looks_like_opinion(headline):
+    return bool(_OPINION_URL.search(headline.get("url", ""))
+                or _OPINION_TITLE.search(headline.get("title", "")))
+
+
+def gather_market_news(limit=14, opinion_limit=6):
+    """
+    Today's major financial-market stories, minus earnings coverage,
+    plus a separate pool of opinion and commentary pieces.
+    """
     print("Gathering market news from the web...")
     today = market_today().strftime("%B %d, %Y")
 
@@ -596,20 +693,51 @@ def gather_market_news(limit=10):
         f"Wall Street Federal Reserve interest rates inflation {today}",
         f"major business financial news investors {today}",
         f"oil gold dollar Treasury markets {today}",
+        f"economy policy trade geopolitics markets news {today}",
     ]
-
     results = []
     for query in queries:
-        results.extend(tavily_search(query, days=1, max_results=limit))
+        results.extend(tavily_search(query, days=1, max_results=10))
 
-    # Keep only stories from roughly the last day.
+    # Keep only stories from roughly the last day, and drop earnings.
     results = [h for h in results if is_recent(h, 30)]
+    dropped = [h for h in results if is_earnings_story(h)]
+    results = [h for h in results if not is_earnings_story(h)]
+    # Opinion pieces that turn up in the news search join the opinion pool.
+    found_opinion = [h for h in results if looks_like_opinion(h)]
+    results = [h for h in results if not looks_like_opinion(h)]
     results = sort_by_recency(dedupe_headlines(results))[:limit]
+    for h in results:
+        h["kind"] = "news"
 
-    print(f"Total market news results collected: {len(results)}")
-    for i, r in enumerate(results, start=1):
-        print(f"  [{i}] {r['title']} — {r['publisher']}")
-    return results
+    opinion_queries = [
+        f"opinion column markets economy investors {today}",
+        f"commentary analysis Wall Street Fed economy columnist {today}",
+    ]
+    opinions = list(found_opinion)
+    for query in opinion_queries:
+        opinions.extend(tavily_search(query, days=2, max_results=10))
+    opinions = [h for h in opinions
+                if is_recent(h, 54) and not is_earnings_story(h)]
+    # Prefer pieces that are clearly labelled opinion; otherwise let the
+    # AI judge from the commentary search results.
+    labelled = [h for h in opinions if looks_like_opinion(h)]
+    opinions = labelled or opinions
+    titles = {h["title"].strip().lower() for h in results}
+    opinions = [h for h in sort_by_recency(dedupe_headlines(opinions))
+                if h["title"].strip().lower() not in titles][:opinion_limit]
+    for h in opinions:
+        h["kind"] = "opinion"
+
+    print(
+        f"Market news: {len(results)} stories, {len(opinions)} opinion "
+        f"candidates ({len(labelled)} clearly labelled), "
+        f"{len(dropped)} earnings headlines excluded"
+    )
+    combined = results + opinions
+    for i, r in enumerate(combined, start=1):
+        print(f"  [{i}] ({r['kind']}) {r['title']} — {r['publisher']}")
+    return combined
 
 
 def gather_sectors(mapping):
@@ -1616,6 +1744,12 @@ def build_ticker_notes(tickers):
             f"\n{r['ticker']} — {r['name']} | daily {r['daily']:+.2f}% | "
             f"YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
         )
+        bench = r.get("benchmarks") or []
+        if bench:
+            lines.append("  Benchmarks today: " + "; ".join(
+                f"{b['label']} ({b['ticker']}) {b['daily']:+.2f}%{_stale_tag(b)}"
+                for b in bench
+            ))
         if r["headlines"]:
             lines += _fmt_headline_lines(r["headlines"], snippet_chars=300)
         else:
@@ -1624,8 +1758,9 @@ def build_ticker_notes(tickers):
     prompt = f"""
 You are writing the company-by-company review in a professional daily
 market review dated {_report_date()}, sent after the U.S. close. Price
-moves are today's close unless tagged "[last data ...]". Each headline
-shows its publication time.
+moves are today's close unless tagged "[last data ...]". Each ticker
+shows how its market and sector benchmarks moved today, and each
+headline shows its publication time (up to a week back).
 
 TRACKED TICKERS:
 {chr(10).join(lines)}
@@ -1641,10 +1776,17 @@ RULES
   products, regulation, analyst actions, industry news. Cite headline
   numbers from that ticker's own list.
 - If nothing is from today, say there was no fresh company-specific news
-  today; you may mention background from the last two days, labeled as such.
-- For a move of roughly 1% or more that the sources don't explain, say
-  it is unexplained by the sources reviewed. Don't infer a cause from
-  the price move alone. Never fabricate events or sources.
+  today. Recent headlines from earlier in the week (for example, Friday's
+  news in a Monday report) are useful background: use them, and say when
+  they were published.
+- Always explain the move relative to its benchmarks. If the stock moved
+  roughly in line with its market or sector (within about 1 percentage
+  point), say it moved with the market or sector; that is an explanation,
+  not an unexplained move.
+- Only if the stock diverged from its benchmarks by roughly 1 point or
+  more and no headline accounts for it, say the divergence is unexplained
+  by the sources reviewed. Don't invent a company-specific cause from the
+  price move alone. Never fabricate events or sources.
 """
     parsed = _groq_call(prompt, max_tokens=3500, temperature=0.3,
                         label="tickers")
@@ -1682,7 +1824,7 @@ def _parse_stories(parsed, market_news):
     if not isinstance(raw, list):
         return []
     stories = []
-    for s in raw[:5]:
+    for s in raw[:8]:
         if not isinstance(s, dict):
             continue
         summary = _text(_pick(s, "summary", "body", "text", "content",
@@ -1692,58 +1834,106 @@ def _parse_stories(parsed, market_news):
         idx = _as_int_list(_pick(s, "source_index", "source", "index",
                                  "cite", "cites"))
         idx = idx[0] if idx else None
+        valid = isinstance(idx, int) and 1 <= idx <= len(market_news)
         title = _text(_pick(s, "title", "headline", "name"))
-        if not title and isinstance(idx, int) and 1 <= idx <= len(market_news):
+        if not title and valid:
             title = market_news[idx - 1]["title"]
+        # The source list decides what's opinion, not the model's label.
+        kind = market_news[idx - 1].get("kind", "news") if valid else "news"
+        source_title = market_news[idx - 1]["title"] if valid else ""
+        if kind != "opinion" and (
+                is_earnings_story({"title": title})
+                or is_earnings_story({"title": source_title})):
+            print(f"Dropping earnings story from Top Stories: {title}")
+            continue
         stories.append({"title": title, "summary": summary,
-                        "source_index": idx})
-    return stories
+                        "source_index": idx, "kind": kind})
+
+    # Exactly one opinion piece, listed last.
+    news = [s for s in stories if s["kind"] != "opinion"]
+    opinion = [s for s in stories if s["kind"] == "opinion"][:1]
+    return news[:4] + opinion
+
+
+def _stories_complete(stories, market_news):
+    """Five stories with one opinion piece, when the sources allow it."""
+    have_opinion = any(h.get("kind") == "opinion" for h in market_news)
+    news_available = sum(1 for h in market_news if h.get("kind") != "opinion")
+    want_news = min(4, news_available)
+    got_news = sum(1 for s in stories if s["kind"] != "opinion")
+    got_opinion = any(s["kind"] == "opinion" for s in stories)
+    return got_news >= want_news and (got_opinion or not have_opinion)
 
 
 def build_market_story_summaries(market_news):
     if not market_news:
         return []
 
-    lines = []
-    for i, h in enumerate(market_news, start=1):
-        lines.append(f"[{i}] {h['title']}")
-        lines.append(f"    Publisher: {h['publisher']} | "
-                     f"Published: {fmt_published(h.get('published'))}")
-        if h.get("snippet"):
-            lines.append(f"    Summary: {h['snippet'][:700]}")
+    def block(kind):
+        out = []
+        for i, h in enumerate(market_news, start=1):
+            if h.get("kind", "news") != kind:
+                continue
+            out.append(f"[{i}] {h['title']}")
+            out.append(f"    Publisher: {h['publisher']} | "
+                       f"Published: {fmt_published(h.get('published'))} | "
+                       f"URL: {h.get('url', '')}")
+            if h.get("snippet"):
+                out.append(f"    Summary: {h['snippet'][:700]}")
+        return "\n".join(out) or "(none)"
 
     prompt = f"""
 You are writing the "Top Market Stories" section of a professional daily
 market review dated {_report_date()}, sent after the U.S. close.
 
-MARKET HEADLINES:
-{chr(10).join(lines)}
+NEWS HEADLINES:
+{block("news")}
+
+OPINION AND COMMENTARY CANDIDATES:
+{block("opinion")}
 
 Return JSON exactly in this shape:
 {{"stories": [{{"title": "headline", "summary": "150-220 words",
   "source_index": 1}}]}}
 
 RULES
-- Pick the 4-5 most important DISTINCT stories, like tonight's front page
-  of Bloomberg, the FT or Reuters: central banks, economic data, policy,
-  geopolitics and trade, big moves in rates/currencies/commodities/credit,
-  major industry or corporate news.
+- Return exactly 5 entries: 4 news stories followed by 1 opinion piece.
+- News stories: the 4 most important DISTINCT stories from NEWS
+  HEADLINES, like tonight's front page of Bloomberg, the FT or Reuters:
+  central banks, economic data, policy, geopolitics and trade, big moves
+  in rates/currencies/commodities/credit, major industry or corporate news.
+- NO earnings stories. Skip anything about a company's quarterly results,
+  EPS, revenue versus estimates, guidance, or an upcoming report, even if
+  it seems important. Earnings are covered elsewhere in the review.
 - Don't just restate today's index performance.
-- Each summary: what happened, context, why investors care, what could
-  matter next. Use only the supplied material; never invent facts.
-- source_index is the number of the headline the story is based on.
-- Don't pick stories that exclusively discuss a certain company's
-  upcoming/previous earnings report.
-- If there's only enough material for one or two stories, return those.
+- Each news summary: what happened, context, why investors care, what
+  could matter next.
+- Opinion piece: choose the single most thoughtful markets or economics
+  opinion, column or commentary piece from OPINION AND COMMENTARY
+  CANDIDATES. It must be an argument from a columnist or commentator,
+  not a straight news report, and not about earnings. Its summary states
+  the author's argument and evidence, attributes it to them ("the
+  columnist argues..."), and closes with the strongest counterpoint or
+  what would prove it wrong. Never present the author's view as fact.
+- source_index is the number of the item the entry is based on.
+- Use only the supplied material; never invent facts, authors or quotes.
+- If no candidate is genuinely an opinion piece, return only the 4 news
+  stories. If there are fewer than 4 distinct non-earnings news stories,
+  return those you have.
 """
-    parsed = _groq_call(prompt, max_tokens=4000, temperature=0.3,
-                        label="stories")
-    stories = _parse_stories(parsed, market_news) if parsed else []
-    if not stories:
-        print("Stories came back empty; retrying once.")
-        parsed = _groq_call(prompt, max_tokens=4000, temperature=0.2,
-                            label="stories retry")
-        stories = _parse_stories(parsed, market_news) if parsed else []
+    stories = []
+    for attempt, temp in ((1, 0.3), (2, 0.2)):
+        parsed = _groq_call(prompt, max_tokens=4500, temperature=temp,
+                            label="stories" if attempt == 1
+                            else "stories retry")
+        result = _parse_stories(parsed, market_news) if parsed else []
+        if (_stories_complete(result, market_news)
+                or len(result) > len(stories)):
+            stories = result
+        if _stories_complete(stories, market_news):
+            break
+        print(f"Stories incomplete ({len(stories)} returned); "
+              + ("retrying once." if attempt == 1 else "keeping best."))
     return stories
 
 
@@ -1788,7 +1978,8 @@ def build_overview(indices, sectors, factors, tickers, portfolio, macro,
         port = "No portfolio weights supplied."
 
     story_lines = "\n".join(
-        f"- {s['title']}: {s['summary'][:350]}" for s in stories
+        f"- {'[OPINION — a columnist view, not fact] ' if s.get('kind') == 'opinion' else ''}"
+        f"{s['title']}: {s['summary'][:350]}" for s in stories
     ) or "(none)"
     recap_lines = "\n".join(
         f"- {e['company'] or e['ticker']}: {e['blurb'][:300]}"
@@ -2124,8 +2315,13 @@ def build_market_stories(market_news, ai):
         return "<p>Unavailable.</p>"
     html = ""
     for story in stories:
-        title = html_escape(str(story.get("title") or "").strip())
-        if title:
+        title = str(story.get("title") or "").strip()
+        if story.get("kind") == "opinion":
+            title = _OPINION_TITLE.sub("", title).strip()
+        title = html_escape(title)
+        if story.get("kind") == "opinion":
+            html += f"<h2>Opinion: {title}</h2>" if title else "<h2>Opinion</h2>"
+        elif title:
             html += f"<h2>{title}</h2>"
         idx = story.get("source_index")
         if isinstance(idx, int) and 1 <= idx <= len(market_news):
@@ -2477,7 +2673,7 @@ def main():
     macro = gather_macro_data()
 
     print("Gathering market headlines...")
-    market_news = gather_market_news(limit=10)
+    market_news = gather_market_news()
 
     print("Gathering recent earnings...")
     recent_earnings = gather_recent_earnings()
