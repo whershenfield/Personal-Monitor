@@ -16,5 +16,5 @@ AVANTIS_PORTFOLIO = ["CAUS.TO", "CALV.TO", "CACE.TO", "CADE.TO"]
 AVANTIS_PORTFOLIO_WEIGHTS = {"CAUS.TO": 0.35,"CALV.TO": 0.15,"CACE.TO": 0.20,"CADE.TO": 0.30}
 
 EMAIL_SENDER = "whershenfield@gmail.com"
-EMAIL_PASSWORD = "hnsijiihlefhkkod"
+EMAIL_PASSWORD = ""
 EMAIL_RECIPIENT = ["whershenfield.hba2028@ivey.ca"]
