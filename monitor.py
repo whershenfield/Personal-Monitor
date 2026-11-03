@@ -3,6 +3,7 @@ import json
 import os
 import csv
 import io
+import re
 from functools import lru_cache
 from datetime import datetime, date, timedelta, time as dtime
 
@@ -734,19 +735,88 @@ def gather_group(
     return rows
 
 
-def gather_market_news(limit=10):
-    """
-    Search the current web for major financial-market stories.
+# Article screening for the Top Market Stories section.
+# Company earnings are covered in the company-by-company review, so the
+# market stories exclude them. "Hourly/weekly earnings" (wage data in the
+# jobs report) is a macro figure and is deliberately not excluded.
 
-    This is deliberately broad rather than ticker-driven. The goal is
-    to surface the day's important investor-relevant stories, similar
-    to a concise financial front page, and then let Groq select the
-    most important distinct stories.
-    """
+EARNINGS_TITLE_PATTERN = re.compile(
+    r"(?<!hourly )(?<!weekly )(?<!wage )\bearnings?\b"
+    r"|\beps\b"
+    r"|\bquarterly (results|profit|loss|revenue|sales)\b"
+    r"|\b(first|second|third|fourth)[- ]quarter "
+    r"(results|profit|loss|earnings|revenue|sales)\b"
+    r"|\bq[1-4] (results|profit|loss|earnings|revenue|sales)\b"
+    r"|\b(beats?|tops?|miss|misses) (estimates|expectations|forecasts|views)\b"
+    r"|\b(profit|revenue|sales) (rises|falls|jumps|drops|slumps|surges|beats|misses|tops)\b"
+    r"|\bguidance\b"
+    r"|\b(reports|posts) (results|profit|loss)\b",
+    re.IGNORECASE,
+)
 
-    print(
-        "Gathering market news from the web..."
+# URL path fragments and headline prefixes that mark opinion/commentary.
+OPINION_URL_MARKERS = (
+    "/opinion",
+    "/commentary",
+    "/breakingviews",
+    "/columnists",
+    "/columnist/",
+    "/column/",
+    "/op-ed",
+    "/oped",
+    "/leaders/",
+)
+
+OPINION_TITLE_PREFIXES = (
+    "opinion",
+    "op-ed",
+    "column",
+    "commentary",
+    "breakingviews",
+    "editorial",
+    "viewpoint",
+)
+
+# Outlets with well-labelled opinion sections on markets and the economy.
+OPINION_DOMAINS = [
+    "bloomberg.com",
+    "reuters.com",
+    "wsj.com",
+    "ft.com",
+    "economist.com",
+    "project-syndicate.org",
+    "theglobeandmail.com",
+    "financialpost.com",
+    "cnbc.com",
+    "marketwatch.com",
+    "barrons.com",
+]
+
+# Search snippets are trimmed so a larger candidate pool does not
+# inflate the Groq prompt.
+SNIPPET_CHARS = 700
+
+
+def is_earnings_story(title):
+    return bool(EARNINGS_TITLE_PATTERN.search(title or ""))
+
+
+def is_opinion_piece(url, title):
+    path = urlparse(url or "").path.lower()
+
+    if any(marker in path for marker in OPINION_URL_MARKERS):
+        return True
+
+    lowered = (title or "").strip().lower()
+
+    return any(
+        lowered.startswith(prefix)
+        for prefix in OPINION_TITLE_PREFIXES
     )
+
+
+def tavily_news_search(query, days, max_results, include_domains=None):
+    """Run one Tavily news search and return its raw results."""
 
     api_key = getattr(
         config,
@@ -755,152 +825,187 @@ def gather_market_news(limit=10):
     )
 
     if not api_key:
+        return []
+
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": "advanced",
+        "topic": "news",
+        "days": days,
+        "max_results": max_results,
+        "include_answer": False,
+    }
+
+    if include_domains:
+        payload["include_domains"] = include_domains
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            headers={
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            print(
+                "Tavily search failed: "
+                f"{response.status_code} "
+                f"{response.text[:500]}"
+            )
+            return []
+
+        return response.json().get("results", []) or []
+
+    except Exception as e:
+        print(
+            f"News search exception: {e}"
+        )
+        return []
+
+
+def gather_market_news(news_limit=15, opinion_limit=5):
+    """
+    Search the current web for major financial-market stories and
+    opinion pieces.
+
+    This is deliberately broad rather than ticker-driven. Earnings
+    stories are screened out. News results come first, followed by
+    opinion candidates; each item carries an is_opinion flag so Groq
+    can pick four news stories and one opinion piece.
+    """
+
+    print(
+        "Gathering market news from the web..."
+    )
+
+    if not getattr(config, "TAVILY_API_KEY", ""):
         print(
             "TAVILY_API_KEY is not configured."
         )
         return []
 
-    today = market_today()
+    today = market_today().isoformat()
 
-    queries = [
+    news_queries = [
         (
             "major financial market news "
-            "stocks bonds economy today "
-            f"{today.isoformat()}"
+            f"stocks bonds economy today {today}"
         ),
         (
             "Wall Street markets Federal Reserve "
-            "interest rates inflation today "
-            f"{today.isoformat()}"
+            f"interest rates inflation today {today}"
         ),
         (
             "major business financial news "
-            "investors today "
-            f"{today.isoformat()}"
+            f"investors today {today}"
         ),
         (
             "oil gold dollar Treasury markets "
-            f"today {today.isoformat()}"
+            f"today {today}"
+        ),
+        (
+            "trade policy tariffs geopolitics "
+            f"regulation markets today {today}"
         ),
     ]
 
-    results = []
+    opinion_queries = [
+        (
+            "opinion column markets economy "
+            f"investors {today}"
+        ),
+        (
+            "commentary Federal Reserve inflation "
+            f"economy outlook opinion {today}"
+        ),
+    ]
+
+    news = []
+    opinions = []
     seen_urls = set()
     seen_titles = set()
+    excluded = []
 
-    for query in queries:
+    def add_results(results):
 
-        try:
+        for result in results:
 
-            response = requests.post(
-                "https://api.tavily.com/search",
-                headers={
-                    "Content-Type":
-                        "application/json",
-                },
-                json={
-                    "api_key": api_key,
-                    "query": query,
-                    "search_depth": "advanced",
-                    "topic": "news",
-                    "days": 2,
-                    "max_results": limit,
-                    "include_answer": False,
-                },
-                timeout=30,
-            )
-
-            if response.status_code != 200:
-
-                print(
-                    "Tavily search failed: "
-                    f"{response.status_code} "
-                    f"{response.text[:500]}"
-                )
-
-                continue
-
-            data = response.json()
-
-        except Exception as e:
-
-            print(
-                f"News search exception: {e}"
-            )
-
-            continue
-
-        for result in (
-            data.get("results", [])
-        ):
-
-            title = str(
-                result.get(
-                    "title",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            url = str(
-                result.get(
-                    "url",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            content = str(
-                result.get(
-                    "content",
-                    ""
-                )
-                or ""
-            ).strip()
+            title = str(result.get("title", "") or "").strip()
+            url = str(result.get("url", "") or "").strip()
+            content = str(result.get("content", "") or "").strip()
 
             if not title or not url:
                 continue
 
-            title_key = (
-                title.lower()
-            )
+            title_key = title.lower()
 
-            if (
-                url in seen_urls
-                or title_key in seen_titles
-            ):
+            if url in seen_urls or title_key in seen_titles:
                 continue
 
             seen_urls.add(url)
             seen_titles.add(title_key)
 
-            results.append(
-                {
-                    "title": title,
-                    "publisher": news_publisher(result),
-                    "url": url,
-                    "snippet": content,
-                }
-            )
+            if is_earnings_story(title):
+                excluded.append(title)
+                continue
 
-    # Keep the strongest first results while preventing one query
-    # from dominating the entire list.
-    results = results[:limit]
+            opinion = is_opinion_piece(url, title)
+
+            item = {
+                "title": title,
+                "publisher": news_publisher(result),
+                "url": url,
+                "snippet": content[:SNIPPET_CHARS],
+                "is_opinion": opinion,
+            }
+
+            if opinion:
+                opinions.append(item)
+            else:
+                news.append(item)
+
+    for query in news_queries:
+        add_results(
+            tavily_news_search(query, days=2, max_results=10)
+        )
+
+    for query in opinion_queries:
+        add_results(
+            tavily_news_search(
+                query,
+                days=3,
+                max_results=10,
+                include_domains=OPINION_DOMAINS,
+            )
+        )
+
+    results = news[:news_limit] + opinions[:opinion_limit]
 
     print(
-        "Total market news results collected: "
-        f"{len(results)}"
+        f"Market news collected: {len(news[:news_limit])} news, "
+        f"{len(opinions[:opinion_limit])} opinion; "
+        f"{len(excluded)} earnings stories excluded"
     )
 
-    for i, result in enumerate(
-        results,
-        start=1,
-    ):
+    for title in excluded:
+        print(f"  [excluded: earnings] {title}")
 
+    for i, result in enumerate(results, start=1):
+        label = "Opinion" if result["is_opinion"] else "News"
         print(
-            f"  [{i}] "
+            f"  [{i}] ({label}) "
             f"{result['title']} — "
             f"{result['publisher']}"
+        )
+
+    if not opinions:
+        print(
+            "No opinion pieces found; the review will "
+            "run five news stories instead."
         )
 
     return results
@@ -1828,6 +1933,15 @@ def build_ai_summary(
             )
 
             lines.append(
+                "    Type: "
+                + (
+                    "OPINION / COMMENTARY"
+                    if h.get("is_opinion")
+                    else "News"
+                )
+            )
+
+            lines.append(
                 f"    Publisher: "
                 f"{h['publisher']}"
             )
@@ -1851,28 +1965,11 @@ def build_ai_summary(
 
     def fmt_lookahead(lookahead_data):
 
+        # Upcoming earnings are deliberately left out of the prompt: the
+        # forward view covers the broad market only. The earnings
+        # calendar still appears in the email's Looking Ahead lists.
+
         lines = []
-
-        if lookahead_data[
-            "earnings"
-        ]:
-
-            lines.append(
-                "UPCOMING EARNINGS"
-            )
-
-            for earnings in sorted(
-                lookahead_data[
-                    "earnings"
-                ],
-                key=lambda x: x["date"],
-            ):
-
-                lines.append(
-                    f"{earnings['date']}: "
-                    f"{earnings['ticker']} "
-                    f"({earnings['name']})"
-                )
 
         if lookahead_data[
             "macro"
@@ -2025,7 +2122,7 @@ REQUIRED JSON
     "key_question": "<one central investment question>"
   }},
 
-  "looking_ahead": "<3-5 sentence forward-looking summary>",
+  "looking_ahead": "<3-5 sentence forward view on the broad market, no earnings>",
 
   "bottom_line": "<2-4 sentence final assessment>"
 }}
@@ -2081,8 +2178,17 @@ AFTER-HOURS AND EARNINGS TIMING
   reaction will show in the next session rather than guessing it.
 
 MARKET STORIES
-- Select 3-5 of the most important DISTINCT stories from the supplied
-  market-news search results.
+- Select exactly 5 DISTINCT items from the MARKET HEADLINES list:
+  4 news stories (Type: News) and 1 opinion piece
+  (Type: OPINION / COMMENTARY), with the opinion piece last.
+- If no OPINION / COMMENTARY item is supplied, select 5 news stories
+  instead. Never present a news item as opinion, or an opinion item
+  as news.
+- EXCLUDE any item whose main subject is corporate earnings:
+  quarterly results, earnings season, guidance, EPS or analyst
+  estimates. Earnings are covered elsewhere in the review. An item
+  may mention earnings in passing only if its main subject is
+  something else.
 - Think of this section as a concise morning/evening market briefing
   similar in spirit to the front page of Bloomberg, Financial Times,
   CNBC, or Reuters.
@@ -2101,30 +2207,38 @@ MARKET STORIES
 - Do not simply describe today's market performance. The Market
   Dashboard already provides those numbers.
 - Each summary should be roughly 180-250 words.
-- Explain what happened, the relevant context, why investors care,
-  and what could matter next.
+- For news stories: explain what happened, the relevant context, why
+  investors care, and what could matter next.
+- For the opinion piece: summarize the author's central argument and
+  the evidence offered, attributing it clearly (for example "the
+  columnist argues..."). Never state the author's view as fact.
+  Explain why the argument matters for investors and identify the
+  key assumption it depends on.
 - Do not duplicate stories that are essentially about the same event.
 - Use only information contained in the supplied search results.
 - Do not invent facts, quotes, events, sources or explanations that
   are not reasonably supported by the supplied material.
 - source_index MUST correspond to the numbered MARKET HEADLINES list.
 - If the supplied search results do not contain enough reliable material
-  for three distinct stories, return only the number of stories that
-  can be supported. Never manufacture additional stories.
+  for five distinct items, return only the number that can be
+  supported. Never manufacture additional stories.
 INVESTMENT IMPLICATIONS
 - Bull case: strongest arguments supporting current conditions.
 - Bear case: strongest risks or challenges.
 - Key question: one specific question that should guide monitoring.
 - These should be analytical rather than repetitive.
 
-LOOKING AHEAD
-- Mention specific upcoming tracked-company earnings where available.
-  The upcoming list excludes companies that already reported today.
-- If a tracked company reported after today's close, note that the
-  next session will confirm or reverse the after-hours reaction.
-- Mention specific macro developments only when visible in the
-  supplied lookahead data.
-- Explain what matters and why, rather than providing only a calendar.
+LOOKING AHEAD (FORWARD VIEW)
+- Focus only on the broad market: what today's moves in equities,
+  rates, sectors, factors and cross-asset markets imply for the
+  days ahead, and which macro developments could change that picture.
+- Do NOT mention earnings at all: no company results, earnings
+  season, upcoming reports, guidance or estimates. Do not discuss
+  individual companies.
+- Mention specific macro developments (central banks, economic data,
+  policy, geopolitics) only when they appear in the supplied data
+  or headlines.
+- Explain what matters and why, rather than providing a calendar.
 - Be concrete rather than generic.
 
 BOTTOM LINE
@@ -2136,7 +2250,7 @@ BOTTOM LINE
 
     parsed = _groq_call(
         prompt,
-        max_tokens=6500,
+        max_tokens=8000,
         temperature=0.3,
     )
 
@@ -2255,14 +2369,21 @@ BOTTOM LINE
         or []
     )
 
+    # The story type comes from the source article itself, not from the
+    # model, so a news piece can never be labelled as opinion. Any
+    # earnings story the model selects anyway is dropped, and the final
+    # list is at most four news stories plus one opinion piece (or five
+    # news stories when no opinion piece was available).
+
     stories = []
+    opinion_story = None
 
     if isinstance(
         stories_raw,
         list,
     ):
 
-        for story in stories_raw[:5]:
+        for story in stories_raw:
 
             if not isinstance(
                 story,
@@ -2270,28 +2391,52 @@ BOTTOM LINE
             ):
                 continue
 
-            stories.append(
-                {
-                    "title": str(
-                        story.get(
-                            "title"
-                        )
-                        or ""
-                    ).strip(),
+            title = str(
+                story.get("title") or ""
+            ).strip()
 
-                    "summary": str(
-                        story.get(
-                            "summary"
-                        )
-                        or ""
-                    ).strip(),
+            summary = str(
+                story.get("summary") or ""
+            ).strip()
 
-                    "source_index":
-                        story.get(
-                            "source_index"
-                        ),
-                }
+            source_index = story.get(
+                "source_index"
             )
+
+            source = None
+
+            if (
+                isinstance(source_index, int)
+                and 1 <= source_index <= len(market_news)
+            ):
+                source = market_news[source_index - 1]
+
+            if is_earnings_story(title) or (
+                source and is_earnings_story(source.get("title"))
+            ):
+                print(f"Dropped earnings story: {title}")
+                continue
+
+            entry = {
+                "title": title,
+                "summary": summary,
+                "source_index": source_index,
+                "is_opinion": bool(
+                    source and source.get("is_opinion")
+                ),
+            }
+
+            if entry["is_opinion"]:
+                if opinion_story is None:
+                    opinion_story = entry
+                continue
+
+            stories.append(entry)
+
+    stories = stories[: 4 if opinion_story else 5]
+
+    if opinion_story:
+        stories.append(opinion_story)
 
     # Normalize investment implications
 
@@ -2947,7 +3092,10 @@ def build_market_stories(
         )
 
         if title:
-            html += f"<h2>{title}</h2>"
+            if story.get("is_opinion"):
+                html += f"<h2>Opinion: {title}</h2>"
+            else:
+                html += f"<h2>{title}</h2>"
 
         if (
             isinstance(source_index, int)
@@ -3728,9 +3876,7 @@ def main():
     )
 
     market_news = (
-        gather_market_news(
-            limit=10
-        )
+        gather_market_news()
     )
 
     print(
