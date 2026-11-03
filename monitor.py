@@ -90,19 +90,6 @@ UPCOMING_EARNINGS_DAYS = getattr(config, "UPCOMING_EARNINGS_DAYS", 2)
 UPCOMING_EARNINGS_LIMIT = getattr(config, "UPCOMING_EARNINGS_LIMIT", 8)
 UPCOMING_EARNINGS_MIN_CAP = getattr(config, "UPCOMING_EARNINGS_MIN_CAP", 20e9)
 
-# After-hours earnings reactions (overridable in config.py).
-# Smallest company (market cap) checked for an after-hours move.
-AFTER_HOURS_MIN_CAP = getattr(config, "AFTER_HOURS_MIN_CAP", 10e9)
-# Most after-hours movers kept (they feed the earnings recap and summary).
-AFTER_HOURS_LIMIT = getattr(config, "AFTER_HOURS_LIMIT", 8)
-# After-hours moves at least this large (%) always get a write-up in the
-# earnings recap, even if the company is smaller than the day's biggest
-# reporters.
-AFTER_HOURS_RECAP_MOVE = getattr(config, "AFTER_HOURS_RECAP_MOVE", 5.0)
-# Companies whose report time isn't listed only count as after-hours
-# movers above this move (%), since they may have reported before the open.
-AFTER_HOURS_UNTIMED_MOVE = getattr(config, "AFTER_HOURS_UNTIMED_MOVE", 2.0)
-
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -152,13 +139,6 @@ def fmt_published(dt):
     if not dt:
         return "time unknown"
     return dt.astimezone(MARKET_TZ).strftime("%b %d, %I:%M %p ET")
-
-
-def fmt_et_time(dt):
-    """Clock time in New York, e.g. '7:55 PM ET'."""
-    if not dt:
-        return ""
-    return dt.astimezone(MARKET_TZ).strftime("%I:%M %p ET").lstrip("0")
 
 
 # ---------------------------------------------------------------------------
@@ -324,106 +304,6 @@ def get_quote(ticker):
         if q and q["stale"]:
             print(f"WARNING: {ticker} latest data is from {q['as_of']}")
     return _QUOTE_CACHE[ticker]
-
-
-# ---------------------------------------------------------------------------
-# After-hours prices
-#
-# The report goes out around 9:30 PM ET, after the after-hours session has
-# ended (8 PM ET). For companies that report after the close, the
-# after-hours move is the market's first verdict on the results, so we
-# measure the last after-hours trade against today's regular close.
-# ---------------------------------------------------------------------------
-
-_AFTER_HOURS_CACHE = {}
-
-
-def yahoo_symbol(ticker):
-    """Nasdaq writes share classes as BRK/B or BRK.B; Yahoo uses BRK-B."""
-    return ticker.replace("/", "-").replace(".", "-")
-
-
-def _fetch_after_hours(ticker):
-    """
-    Latest after-hours price today versus today's regular-session close.
-    Returns None if the stock didn't trade after hours today.
-    """
-    today = market_today()
-
-    close = None
-    quote = get_quote(ticker)
-    if quote and quote["as_of"] == today:
-        close = quote["price"]
-
-    price = as_of = None
-    try:
-        bars = yf.Ticker(ticker).history(
-            period="5d", interval="5m", prepost=True, auto_adjust=False
-        )
-    except Exception as e:
-        print(f"After-hours fetch failed for {ticker}: {e}")
-        bars = None
-
-    if bars is not None and not bars.empty and "Close" in bars:
-        bars = bars.dropna(subset=["Close"])
-        local = [
-            ts.tz_convert(MARKET_TZ) if ts.tzinfo else ts.tz_localize(MARKET_TZ)
-            for ts in bars.index
-        ]
-        minutes = [t.hour * 60 + t.minute for t in local]
-        on_today = [t.date() == today for t in local]
-        # Regular session: 9:30 AM to 4:00 PM. After hours: 4:00 PM onward.
-        regular_mask = [d and 570 <= m < 960 for d, m in zip(on_today, minutes)]
-        post_mask = [d and m >= 960 for d, m in zip(on_today, minutes)]
-
-        regular = bars[regular_mask]
-        post = bars[post_mask]
-        if close is None and not regular.empty:
-            close = float(regular["Close"].iloc[-1])
-        if not post.empty:
-            price = float(post["Close"].iloc[-1])
-            as_of = [t for t, keep in zip(local, post_mask) if keep][-1]
-
-    if price is None:
-        # Fallback: Yahoo's quote summary carries a post-market price.
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:
-            info = {}
-        p, t = info.get("postMarketPrice"), info.get("postMarketTime")
-        if p and t:
-            try:
-                stamp = datetime.fromtimestamp(
-                    int(t), tz=timezone.utc
-                ).astimezone(MARKET_TZ)
-            except (TypeError, ValueError, OSError):
-                stamp = None
-            if stamp and stamp.date() == today and stamp.hour >= 16:
-                price, as_of = float(p), stamp
-
-    if price is None or not close:
-        return None
-
-    return {
-        "price": price,
-        "close": close,
-        "change": (price - close) / close * 100,
-        "as_of": as_of,
-    }
-
-
-def get_after_hours(ticker):
-    if ticker not in _AFTER_HOURS_CACHE:
-        _AFTER_HOURS_CACHE[ticker] = _fetch_after_hours(ticker)
-    return _AFTER_HOURS_CACHE[ticker]
-
-
-def after_hours_label(ah):
-    """e.g. '-8.42% after hours as of 7:55 PM ET'."""
-    label = f"{format_pct(ah['change'])} after hours"
-    if ah.get("as_of"):
-        label += f" as of {fmt_et_time(ah['as_of'])}"
-    return label
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +848,6 @@ def fetch_earnings_calendar(day):
             continue
         out.append({
             "ticker": symbol,
-            "yahoo": yahoo_symbol(symbol),
             "name": str(row.get("name") or symbol).strip(),
             "date": day,
             "timing": _TIME_LABELS.get(row.get("time"), "Time n/a"),
@@ -980,124 +859,43 @@ def fetch_earnings_calendar(day):
     return out
 
 
-def gather_after_hours_movers(today_rows):
-    """
-    After-hours move for every sizeable company that reported after
-    today's close, ranked by the size of the move.
-    """
-    pool = [
-        r for r in today_rows
-        if r["timing"] in ("After close", "Time n/a")
-        and r["market_cap"] >= AFTER_HOURS_MIN_CAP
-    ]
-    after_close_count = sum(1 for r in pool if r["timing"] == "After close")
-
-    movers = []
-    for r in pool:
-        ah = get_after_hours(r["yahoo"])
-        if ah is None:
-            if r["timing"] == "After close":
-                print(f"{r['ticker']}: no after-hours price available")
-            continue
-        # Untimed reporters may have reported before the open, so a small
-        # after-hours drift doesn't tell us anything about their results.
-        if (r["timing"] == "Time n/a"
-                and abs(ah["change"]) < AFTER_HOURS_UNTIMED_MOVE):
-            continue
-        r["after_hours"] = ah
-        movers.append(r)
-
-    movers.sort(key=lambda r: abs(r["after_hours"]["change"]), reverse=True)
-    movers = movers[:AFTER_HOURS_LIMIT]
-    print(
-        "After-hours movers: "
-        + (", ".join(f"{m['ticker']} {format_pct(m['after_hours']['change'])}"
-                     for m in movers) or "none")
-    )
-    return movers, after_close_count
-
-
 def gather_recent_earnings():
     """
-    Biggest companies that reported since the last session (yesterday
-    after the close, plus everyone reporting today), and the after-hours
-    reaction for companies that reported after today's close.
+    Biggest companies that reported since the last session:
+    yesterday after the close, plus everyone reporting today.
     """
     today = market_today()
     prev = previous_business_day(today)
 
-    pool = []
+    candidates = []
     calendar_ok = False
 
     prev_rows = fetch_earnings_calendar(prev)
     if prev_rows is not None:
         calendar_ok = True
-        pool += [r for r in prev_rows if r["timing"] == "After close"]
+        candidates += [r for r in prev_rows if r["timing"] == "After close"]
 
     today_rows = fetch_earnings_calendar(today)
     if today_rows is not None:
         calendar_ok = True
-        pool += today_rows
-
-    for r in pool:
-        _EXTRA_NAMES.setdefault(r["ticker"], r["name"])
-
-    after_hours, after_close_count = gather_after_hours_movers(
-        today_rows or []
-    )
+        candidates += today_rows
 
     candidates = [
-        c for c in pool if c["market_cap"] >= RECENT_EARNINGS_MIN_CAP
+        c for c in candidates if c["market_cap"] >= RECENT_EARNINGS_MIN_CAP
     ]
     candidates.sort(key=lambda c: c["market_cap"], reverse=True)
     candidates = list({c["ticker"]: c for c in candidates}.values())
     candidates = candidates[:RECENT_EARNINGS_LIMIT]
 
-    # Big after-hours movers always get a write-up, even if they're smaller
-    # than the day's largest reporters.
-    chosen = {c["ticker"] for c in candidates}
-    for m in after_hours:
-        if (m["ticker"] not in chosen
-                and abs(m["after_hours"]["change"]) >= AFTER_HOURS_RECAP_MOVE):
-            candidates.append(m)
-            chosen.add(m["ticker"])
-
     for c in candidates:
-        quote = get_quote(c["yahoo"])
-        ah = c.get("after_hours")
-        reported_today = c["date"] == today
-        regular_session = (
-            f"regular session {format_pct(quote['daily'])}"
-            if quote and not quote["stale"] else ""
+        _EXTRA_NAMES.setdefault(c["ticker"], c["name"])
+        quote = get_quote(c["ticker"])
+        reported_after_today_close = (
+            c["date"] == today and c["timing"] == "After close"
         )
-
-        # Shown in each company's "After-Hours Movement" box. Every company
-        # gets the box; only after-close reporters' moves are treated as a
-        # reaction to the results.
-        c["after_hours_display"] = ah or get_after_hours(c["yahoo"])
-        c["after_hours_is_reaction"] = bool(ah) or (
-            reported_today and c["timing"] == "After close"
-        )
-        c["regular_session"] = (
-            quote["daily"] if quote and not quote["stale"] else None
-        )
-
-        if reported_today and c["timing"] == "After close" and ah:
-            c["reaction"] = ah["change"]
-            c["reaction_note"] = after_hours_label(ah)
-            if regular_session:
-                c["reaction_note"] += f" ({regular_session}, before the report)"
-        elif reported_today and c["timing"] == "After close":
+        if reported_after_today_close:
             c["reaction"] = None
-            c["reaction_note"] = (
-                "Reported after today's close; after-hours price unavailable"
-            )
-        elif reported_today and ah:
-            # Report time not listed, but the stock moved after hours.
-            c["reaction"] = ah["change"]
-            c["reaction_note"] = (
-                f"Stock {format_pct(quote['daily'])} today; " if quote else ""
-            ) + after_hours_label(ah)
+            c["reaction_note"] = "Reported after today's close; reaction pending"
         elif quote:
             c["reaction"] = quote["daily"]
             c["reaction_note"] = f"Stock {format_pct(quote['daily'])} today"
@@ -1105,12 +903,11 @@ def gather_recent_earnings():
             c["reaction"] = None
             c["reaction_note"] = "Price reaction unavailable"
 
-        if ah:
-            query = (f'"{c["name"]}" earnings results guidance shares '
-                     "after-hours")
-        else:
-            query = f'"{c["name"]}" quarterly earnings results revenue guidance'
-        news = tavily_search(query, days=3, max_results=6)
+        news = tavily_search(
+            f'"{c["name"]}" quarterly earnings results revenue guidance',
+            days=3,
+            max_results=6,
+        )
         relevant = [
             h for h in news
             if mentions_company(c["ticker"], f"{h['title']} {h['snippet']}")
@@ -1132,12 +929,7 @@ def gather_recent_earnings():
         f"Recent earnings: {len(candidates)} companies "
         f"(calendar {'ok' if calendar_ok else 'unavailable'})"
     )
-    return {
-        "companies": candidates,
-        "general": general,
-        "after_hours": after_hours,
-        "after_close_count": after_close_count,
-    }
+    return {"companies": candidates, "general": general}
 
 
 def extract_earnings_dates(calendar):
@@ -1574,22 +1366,6 @@ def _fmt_macro(m):
     return "\n".join(lines) or "(no macro data)"
 
 
-def _fmt_after_hours(movers):
-    lines = []
-    for m in movers:
-        ah = m["after_hours"]
-        eps = ""
-        if m.get("eps_actual") and m.get("eps_forecast"):
-            eps = f" | EPS {m['eps_actual']} vs. {m['eps_forecast']} est."
-        untimed = " [report time not listed]" if m["timing"] == "Time n/a" else ""
-        lines.append(
-            f"- {m['ticker']} ({m['name']}): {after_hours_label(ah)} "
-            f"(close {ah['close']:.2f}, after hours {ah['price']:.2f}){eps}"
-            f"{untimed}"
-        )
-    return "\n".join(lines) or "(none)"
-
-
 def _report_date():
     return market_today().strftime("%A, %B %d, %Y")
 
@@ -1627,10 +1403,9 @@ def build_earnings_summary(recent):
 
     prompt = f"""
 You are writing the earnings recap section of a professional daily market
-review dated {_report_date()}, delivered around 9:30 PM ET, after both the
-U.S. close and the after-hours session.
+review dated {_report_date()}, delivered after the U.S. close.
 
-COMPANIES THAT REPORTED (largest first, plus any big after-hours movers):
+COMPANIES THAT REPORTED (largest first):
 {chr(10).join(lines) if lines else "(none from calendar)"}
 {general_block}
 
@@ -1644,11 +1419,6 @@ RULES
   that clearly reported in the last day; their cites refer to that list.
 - Each blurb: EPS and revenue versus expectations, guidance, the key
   business driver(s), and the stock reaction given above.
-- For companies that reported after today's close, the after-hours move
-  given above IS the market's reaction. Explain it with the results (for
-  example, a beat overshadowed by weak guidance) where the sources support
-  that, and call it an after-hours move. Their regular-session move came
-  before the report, so never present it as a reaction to the results.
 - Use only numbers and facts in the supplied material. If coverage is
   thin, say what is known and that full details weren't available.
 - Ignore headlines not about that company's own results.
@@ -1919,8 +1689,7 @@ def _parse_overview(parsed):
 
 
 def build_overview(indices, sectors, factors, tickers, portfolio, macro,
-                   stories, earnings_notes, upcoming, previews, macro_heads,
-                   after_hours=None):
+                   stories, earnings_notes, upcoming, previews, macro_heads):
     portfolio_daily = calculate_weighted_portfolio_return(portfolio, "daily")
     portfolio_ytd = calculate_weighted_portfolio_return(portfolio, "ytd")
     if portfolio_daily is not None and portfolio_ytd is not None:
@@ -1949,9 +1718,9 @@ def build_overview(indices, sectors, factors, tickers, portfolio, macro,
 
     prompt = f"""
 You are writing the summary sections of a professional daily market
-review dated {_report_date()}, sent around 9:30 PM ET for someone
+review dated {_report_date()}, sent after the U.S. close, for someone
 building a career in wealth and asset management. All data is today's
-close unless tagged "[last data ...]" or labeled as after hours.
+close unless tagged "[last data ...]".
 
 INDICES:
 {_fmt_rows(indices)}
@@ -1978,10 +1747,6 @@ TODAY'S TOP STORIES:
 EARNINGS JUST REPORTED:
 {recap_lines}
 
-AFTER-HOURS EARNINGS REACTIONS (companies that reported after today's
-close; move versus today's closing price, from thin after-hours trading):
-{_fmt_after_hours(after_hours or [])}
-
 EARNINGS IN THE NEXT TWO BUSINESS DAYS:
 {upcoming_lines}
 
@@ -2004,20 +1769,13 @@ RULES
 - executive_summary: 4-5 bullets, each a meaningful takeaway across
   equities, rates, sectors, factors, earnings and cross-asset markets,
   not a list of numbers. Each bullet is a plain string.
-- After-hours reactions: if any move above is roughly 3% or larger, one
-  executive_summary bullet must cover the biggest one(s): what drove it
-  and what it signals for tomorrow's open, including for the company's
-  sector or peers where relevant. Always call these after-hours moves,
-  never closing prices, and note they come from thin trading.
 - bull_case / bear_case: the 3 strongest arguments each way, analytical
   rather than repetitive. Each point is a plain string.
 - key_question: one specific question to guide monitoring.
 - looking_ahead: the most important upcoming earnings and macro items
   above and what to watch in each. Be concrete.
 - bottom_line: was today constructive, mixed or defensive and why, and
-  the single most important thing to monitor next. If a large
-  after-hours earnings move could set the tone for tomorrow's open,
-  say so.
+  the single most important thing to monitor next.
 - Use only the data above; don't invent facts.
 """
     parsed = _groq_call(prompt, max_tokens=3000, temperature=0.3,
@@ -2047,8 +1805,7 @@ RULES
 
 
 def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
-                     market_news, lookahead, earnings_notes, previews,
-                     after_hours=None):
+                     market_news, lookahead, earnings_notes, previews):
     """
     Runs the analysis as several smaller requests instead of one large one,
     so a single oversized or malformed reply can't blank out the report.
@@ -2058,7 +1815,6 @@ def build_ai_summary(indices, sectors, factors, tickers, portfolio, macro,
     overview = build_overview(
         indices, sectors, factors, tickers, portfolio, macro, stories,
         earnings_notes, lookahead["earnings"], previews, lookahead["macro"],
-        after_hours=after_hours,
     )
     return {"tickers": ticker_notes, "stories": stories, **overview}
 
@@ -2289,87 +2045,6 @@ def build_market_stories(market_news, ai):
     return html
 
 
-def _pct_span(value):
-    if value is None:
-        return "—"
-    return f'<span class="{pct_class(value)}">{format_pct(value)}</span>'
-
-
-def build_after_hours_section(c):
-    """
-    Boxed "After-Hours Movement" section inside each company's earnings
-    write-up: today's close, the last after-hours price, the change, and a
-    line explaining whether that move is the reaction to the results.
-    """
-    ah = c.get("after_hours_display")
-    regular = c.get("regular_session")
-    is_reaction = c.get("after_hours_is_reaction")
-    untimed = c.get("timing") == "Time n/a"
-
-    html = ['<div class="ah-box">']
-
-    if ah:
-        html.append(
-            f"<h3>After-Hours Movement: {_pct_span(ah['change'])}</h3>"
-        )
-        html.append(
-            '<table class="ah-table"><thead><tr>'
-            "<th>Today's Close</th><th>After-Hours Price</th>"
-            "<th>Change</th><th>Last Trade</th>"
-            "<th>Regular Session Today</th>"
-            "</tr></thead><tbody><tr>"
-            f"<td>{ah['close']:.2f}</td>"
-            f"<td>{ah['price']:.2f}</td>"
-            f"<td><strong>{_pct_span(ah['change'])}</strong></td>"
-            f"<td>{html_escape(fmt_et_time(ah.get('as_of')) or '—')}</td>"
-            f"<td>{_pct_span(regular)}</td>"
-            "</tr></tbody></table>"
-        )
-        if is_reaction and untimed:
-            note = (
-                "Nasdaq didn't list a report time, but the size of the "
-                "after-hours move suggests the results came out after the "
-                "close, making this the market's first reaction to them."
-            )
-        elif is_reaction:
-            note = (
-                "Results came out after today's close, so this is the "
-                "market's first reaction to them. The regular-session move "
-                "happened before the report."
-            )
-        else:
-            note = (
-                "Results were already out during today's session, so the "
-                "regular-session move is the main reaction. The after-hours "
-                "change reflects trading since the close."
-            )
-        note += (
-            " After-hours trading is thin, so the price can shift by "
-            "tomorrow's open."
-        )
-    else:
-        html.append("<h3>After-Hours Movement: n/a</h3>")
-        if is_reaction:
-            note = (
-                "Results came out after today's close, but no after-hours "
-                "trades were available, so the market's first reaction will "
-                "show at tomorrow's open."
-            )
-            if regular is not None:
-                note += (
-                    f" Regular session today: {format_pct(regular)} "
-                    "(before the report)."
-                )
-        else:
-            note = "No after-hours trading recorded today."
-            if regular is not None:
-                note += f" Regular session today: {format_pct(regular)}."
-
-    html.append(f'<p class="note">{html_escape(note)}</p>')
-    html.append("</div>")
-    return "".join(html)
-
-
 def build_earnings_recap(recent, earnings_notes):
     if not earnings_notes:
         if recent.get("companies"):
@@ -2397,10 +2072,10 @@ def build_earnings_recap(recent, earnings_notes):
                 )
             elif c.get("eps_forecast"):
                 details.append(f"EPS est. {c['eps_forecast']}")
+            details.append(c["reaction_note"])
             html += (
                 f'<p class="note">{html_escape(" · ".join(details))}</p>'
             )
-            html += build_after_hours_section(c)
             headlines = c["headlines"]
         else:
             headlines = recent.get("general", [])
@@ -2483,18 +2158,6 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 .negative { color: #b00000; }
 .neutral { color: #000; }
 .ticker-review { margin-bottom: 26px; }
-.ah-box { border-left: 3px solid #000; background: #f5f5f5;
-          padding: 8px 14px 2px 14px; margin: 4px 0 14px 0; }
-.ah-box h3 { margin-top: 0; margin-bottom: 4px; }
-.ah-box .note { margin-top: 0; }
-.ah-table { border-collapse: collapse; margin: 4px 0 8px 0; }
-.ah-table th { text-align: left; font-weight: bold; font-size: 13px;
-               border-bottom: 1px solid #000; padding: 4px 16px 4px 0;
-               white-space: nowrap;
-               font-family: "Times New Roman", Times, serif; }
-.ah-table td { padding: 4px 16px 4px 0; white-space: nowrap;
-               font-variant-numeric: tabular-nums;
-               font-family: "Times New Roman", Times, serif; }
 .source { font-size: 12px; margin-top: -4px; margin-bottom: 8px; }
 .source a { color: #000; text-decoration: underline; }
 .note { font-size: 12px; color: #444; margin-top: -4px; }
@@ -2669,7 +2332,7 @@ def main():
     print("Gathering market headlines...")
     market_news = gather_market_news(limit=10)
 
-    print("Gathering recent earnings and after-hours moves...")
+    print("Gathering recent earnings...")
     recent_earnings = gather_recent_earnings()
 
     print("Gathering lookahead...")
@@ -2698,7 +2361,6 @@ def main():
         lookahead=lookahead,
         earnings_notes=earnings_notes,
         previews=previews,
-        after_hours=recent_earnings.get("after_hours", []),
     )
 
     subject = f"{REPORT_TITLE} — {market_today().strftime('%a, %b %d %Y')}"
