@@ -1077,15 +1077,19 @@ def gather_recent_earnings():
         quote = get_quote(c["ticker"])
         fresh = quote is not None and not quote["stale"]
 
-        # Regular-session move today, and any trading since the 4 PM close.
+        # Regular-session move and close today, and any trading since the
+        # 4 PM close.
         c["session"] = quote["daily"] if fresh else None
-        ah = _after_hours_quote(c["ticker"], quote["price"] if fresh else None)
+        c["close"] = quote["price"] if fresh else None
+        ah = _after_hours_quote(c["ticker"], c["close"])
         c["after_hours"] = ah["change"] if ah else None
+        c["after_hours_price"] = ah["price"] if ah else None
         c["after_hours_time"] = ah["as_of"] if ah else None
 
         reported_after_today_close = (
             c["date"] == today and c["timing"] == "After close"
         )
+        c["reported_after_today_close"] = reported_after_today_close
         if reported_after_today_close:
             # The session move happened before the numbers came out, so
             # the after-hours move is the real earnings reaction.
@@ -2330,60 +2334,68 @@ def build_market_stories(market_news, ai):
     return html
 
 
-def build_earnings_table(recent):
-    """
-    At-a-glance table of everyone who just reported, with the regular
-    session move and the after-hours move side by side. The figure that
-    reflects the earnings reaction is bolded.
-    """
-    companies = recent.get("companies", [])
-    if not companies:
-        return ""
+def _pct_span(value, bold=False):
+    if value is None:
+        return "—"
+    tag = "strong" if bold else "span"
+    return f'<{tag} class="{pct_class(value)}">{format_pct(value)}</{tag}>'
 
-    def pct_cell(value, is_reaction):
-        if value is None:
-            return '<td class="number">—</td>'
-        cls = pct_class(value) + (" reaction" if is_reaction else "")
-        return f'<td class="number {cls}">{format_pct(value)}</td>'
 
-    html = [
-        '<table class="data-table"><thead><tr>'
-        "<th>Company</th><th>Reported</th><th>EPS vs. Est.</th>"
-        "<th>Today's Session</th><th>After Hours</th>"
-        "</tr></thead><tbody>"
-    ]
-    for c in companies:
-        if c.get("eps_actual") and c.get("eps_forecast"):
-            eps = f"{c['eps_actual']} vs. {c['eps_forecast']}"
-        elif c.get("eps_forecast"):
-            eps = f"Est. {c['eps_forecast']}"
-        else:
-            eps = "—"
-        source = c.get("reaction_source")
-        html.append(
-            "<tr>"
-            f'<td class="name">{html_escape(c["name"])} '
-            f'<span class="ticker">({html_escape(c["ticker"])})</span></td>'
-            f'<td>{html_escape(c["date"].strftime("%b %d"))}, '
-            f'{html_escape(c["timing"].lower())}</td>'
-            f'<td class="number">{html_escape(eps)}</td>'
-            + pct_cell(c.get("session"), source == "session")
-            + pct_cell(c.get("after_hours"), source == "after_hours")
-            + "</tr>"
+def build_after_hours_box(c):
+    """
+    Shaded box for one company: the after-hours move as the headline,
+    a small price table, and a plain-English note on how to read it.
+    """
+    ah = c.get("after_hours")
+    session = c.get("session")
+    after_close = c.get("reported_after_today_close", False)
+
+    headline = (_pct_span(ah) if ah is not None
+                else '<span class="neutral">n/a</span>')
+    html = '<div class="ah-box">'
+    html += f'<p class="ah-title">After-Hours Movement: {headline}</p>'
+
+    if ah is not None:
+        html += (
+            '<table class="ah-table"><thead><tr>'
+            "<th>Today's Close</th><th>After-Hours Price</th><th>Change</th>"
+            "<th>Last Trade</th><th>Regular Session Today</th>"
+            "</tr></thead><tbody><tr>"
+            f'<td>{c["close"]:.2f}</td>'
+            f'<td>{c["after_hours_price"]:.2f}</td>'
+            f"<td>{_pct_span(ah, bold=True)}</td>"
+            f'<td>{html_escape(fmt_clock(c.get("after_hours_time")))}</td>'
+            f"<td>{_pct_span(session)}</td>"
+            "</tr></tbody></table>"
         )
-    html.append("</tbody></table>")
 
-    stamps = [c["after_hours_time"] for c in companies
-              if c.get("after_hours_time")]
-    as_of = f" After-hours prices as of {fmt_clock(max(stamps))}." if stamps else ""
-    html.append(
-        '<p class="note">Bold marks the earnings reaction: today\'s session '
-        "for companies that reported before today's open or after "
-        "yesterday's close, and after-hours trading for companies that "
-        f"reported after today's close.{as_of} After-hours moves trade on "
-        "thin volume and can shift meaningfully by the next open.</p>"
-    )
-    return "".join(html)
+    thin = ("After-hours trading is thin, so the price can shift by "
+            "tomorrow's open.")
+    if after_close and ah is not None:
+        note = ("Results came out after today's close, so this is the "
+                "market's first reaction to them. The regular-session move "
+                f"happened before the report. {thin}")
+    elif after_close:
+        note = ("Results came out after today's close, but no after-hours "
+                "trades were available, so the market's first reaction will "
+                "show at tomorrow's open.")
+        if session is not None:
+            note += (f" Regular session today: {format_pct(session)} "
+                     "(before the report).")
+    elif ah is not None:
+        note = ("Results were already out during today's session, so the "
+                "regular-session move is the main reaction. The after-hours "
+                f"change reflects trading since the close. {thin}")
+    elif session is not None:
+        note = ("Results were already out during today's session, so the "
+                f"regular-session move ({format_pct(session)}) is the main "
+                "reaction. No after-hours trades were recorded since the "
+                "close.")
+    else:
+        note = "Price data for today was unavailable."
+
+    html += f'<p class="ah-note">{html_escape(note)}</p></div>'
+    return html
 
 
 def build_earnings_recap(recent, earnings_notes):
@@ -2413,14 +2425,14 @@ def build_earnings_recap(recent, earnings_notes):
                 )
             elif c.get("eps_forecast"):
                 details.append(f"EPS est. {c['eps_forecast']}")
-            details.append(c["reaction_note"])
             html += (
                 f'<p class="note">{html_escape(" · ".join(details))}</p>'
             )
+            html += build_after_hours_box(c)
             headlines = c["headlines"]
         else:
             headlines = recent.get("general", [])
-        html += f"<p>{html_escape(e['blurb'])}</p>"
+        html += f'<p class="blurb">{html_escape(e["blurb"])}</p>'
         cited = _cited(headlines, e["cites"])
         if cited:
             html += "".join(build_source_link(h) for h in cited)
@@ -2495,7 +2507,6 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
                     overflow-wrap: break-word; }
 .data-table .number { text-align: right; white-space: nowrap;
                       font-variant-numeric: tabular-nums; }
-.data-table .reaction { font-weight: bold; }
 .positive { color: #008000; }
 .negative { color: #b00000; }
 .neutral { color: #000; }
@@ -2503,6 +2514,20 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 .source { font-size: 12px; margin-top: -4px; margin-bottom: 8px; }
 .source a { color: #000; text-decoration: underline; }
 .note { font-size: 12px; color: #444; margin-top: -4px; }
+.ah-box { background: #f4f4f4; border-left: 4px solid #000;
+          padding: 12px 16px; margin: 6px 0 16px 0; }
+.ah-title { font-size: 17px; font-weight: bold; margin-bottom: 8px; }
+.ah-table { border-collapse: collapse; margin-bottom: 10px; }
+.ah-table th { text-align: left; font-size: 13px; font-weight: bold;
+               border-bottom: 1px solid #000; padding: 3px 16px 4px 0;
+               white-space: nowrap;
+               font-family: "Times New Roman", Times, serif; }
+.ah-table td { font-size: 16px; padding: 6px 16px 2px 0;
+               white-space: nowrap; font-variant-numeric: tabular-nums;
+               font-family: "Times New Roman", Times, serif; }
+.ah-note { font-size: 12px; color: #444; margin: 0; }
+.blurb { font-size: 16px; line-height: 1.6; color: #000;
+         margin-bottom: 10px; }
 .footer { margin-top: 38px; padding-top: 10px; border-top: 1px solid #999;
           font-size: 12px; color: #555; }
 """
@@ -2576,7 +2601,6 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 {build_market_stories(market_news, ai)}
 
 <h1>5. Earnings Recap</h1>
-{build_earnings_table(recent_earnings)}
 {build_earnings_recap(recent_earnings, earnings_notes)}
 
 <h1>6. Investment Implications</h1>
