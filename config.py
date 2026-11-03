@@ -1,3 +1,8 @@
+GROQ_API_KEY = ""
+GIST_ID = ""
+GIST_TOKEN = ""
+TAVILY_API_KEY = ""
+
 INDICES = ["^GSPC", "^IXIC", "^RUT", "^DJI", "EFA", "^GSPTSE"]
 TICKERS = ["EL.PA", "SPGI"]
 
