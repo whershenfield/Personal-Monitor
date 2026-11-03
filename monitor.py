@@ -3,9 +3,8 @@ import json
 import os
 import csv
 import io
-import re
 from functools import lru_cache
-from datetime import datetime, date, timedelta, time as dtime
+from datetime import datetime, date, timedelta
 
 import yfinance as yf
 import pytz
@@ -52,10 +51,6 @@ config.TAVILY_API_KEY = os.environ.get(
 )
 
 MARKET_TZ = pytz.timezone("America/New_York")
-
-# US regular trading session (New York time).
-US_REGULAR_OPEN = dtime(9, 30)
-US_REGULAR_CLOSE = dtime(16, 0)
 
 
 # Default sector ETF proxies; can be overridden in config.py.
@@ -345,191 +340,6 @@ def get_quote_and_ytd(ticker):
         return None, None, None
 
 
-# After-hours and earnings-timing helpers
-
-def is_us_listing(ticker):
-    """
-    True for US-listed stocks and ETFs. Yahoo marks foreign listings with
-    a suffix (EL.PA, VCN.TO), indices with ^ and futures with =. Only US
-    listings have a meaningful after-hours session.
-    """
-
-    return not (
-        "." in ticker
-        or ticker.startswith("^")
-        or "=" in ticker
-    )
-
-
-def format_clock(stamp):
-    """Format a New York timestamp as e.g. '7:55 PM ET'."""
-
-    return stamp.strftime("%I:%M %p").lstrip("0") + " ET"
-
-
-def get_after_hours(ticker, regular_close):
-    """
-    Return today's after-hours move versus the official close, or None.
-
-    This is reported alongside, never inside, the daily return: after-hours
-    trading is thin and can reverse by the next open, so it does not feed
-    the daily, YTD or portfolio figures.
-    """
-
-    if not is_us_listing(ticker) or not regular_close:
-        return None
-
-    today = market_today()
-
-    close_time = MARKET_TZ.localize(
-        datetime.combine(today, US_REGULAR_CLOSE)
-    )
-
-    day_end = MARKET_TZ.localize(
-        datetime.combine(today, dtime(23, 59, 59))
-    )
-
-    price = None
-    as_of = None
-
-    # Primary source: today's 5-minute bars including extended hours.
-    try:
-        bars = yf.Ticker(ticker).history(
-            period="1d",
-            interval="5m",
-            prepost=True,
-        )
-
-        if not bars.empty:
-            index = bars.index
-
-            if index.tz is None:
-                index = index.tz_localize(MARKET_TZ)
-
-            bars.index = index.tz_convert(MARKET_TZ)
-
-            post = bars[
-                (bars.index >= close_time)
-                & (bars.index <= day_end)
-            ].dropna(subset=["Close"])
-
-            if not post.empty:
-                price = float(post["Close"].iloc[-1])
-                as_of = post.index[-1]
-
-    except Exception as e:
-        print(
-            f"After-hours bars failed for {ticker}: {e}"
-        )
-
-    # Fallback: Yahoo's quote summary post-market fields.
-    if price is None:
-        try:
-            info = yf.Ticker(ticker).info or {}
-
-            pm_price = info.get("postMarketPrice")
-            pm_time = info.get("postMarketTime")
-
-            if pm_price and pm_time:
-                stamp = datetime.fromtimestamp(
-                    int(pm_time),
-                    MARKET_TZ,
-                )
-
-                if close_time <= stamp <= day_end:
-                    price = float(pm_price)
-                    as_of = stamp
-
-        except Exception as e:
-            print(
-                f"After-hours quote failed for {ticker}: {e}"
-            )
-
-    if price is None or as_of is None:
-        return None
-
-    pct = (
-        (price - regular_close)
-        / regular_close
-    ) * 100
-
-    return {
-        "price": price,
-        "pct": pct,
-        "as_of": format_clock(as_of),
-    }
-
-
-def describe_earnings_time(stamp, us_listing):
-    """
-    Describe when a release came out, phrased to follow
-    'Earnings released today ...'.
-    """
-
-    if stamp is None or (stamp.hour == 0 and stamp.minute == 0):
-        return "(release time not confirmed)"
-
-    if not us_listing:
-        return (
-            f"at {stamp.strftime('%H:%M')} "
-            "local exchange time"
-        )
-
-    release_time = stamp.time()
-
-    if release_time < US_REGULAR_OPEN:
-        return "before the open"
-
-    if release_time >= US_REGULAR_CLOSE:
-        return "after the close"
-
-    return "during market hours"
-
-
-def get_earnings_today(ticker):
-    """Return a timing description if the company reported today, else None."""
-
-    today = market_today()
-    us_listing = is_us_listing(ticker)
-    stock = yf.Ticker(ticker)
-
-    # Primary source: the earnings history/calendar table, which carries
-    # the release time in the listing's exchange time zone.
-    try:
-        dates = stock.get_earnings_dates(limit=8)
-    except Exception as e:
-        print(
-            f"Earnings-date lookup failed for {ticker}: {e}"
-        )
-        dates = None
-
-    if dates is not None and not dates.empty:
-        for stamp in dates.index:
-            try:
-                if getattr(stamp, "tzinfo", None) is None:
-                    stamp = MARKET_TZ.localize(
-                        stamp.to_pydatetime()
-                    )
-
-                if stamp.date() == today:
-                    return describe_earnings_time(
-                        stamp,
-                        us_listing,
-                    )
-
-            except Exception:
-                continue
-
-    # Fallback: the date-only earnings calendar.
-    try:
-        if today in extract_earnings_dates(stock.calendar):
-            return describe_earnings_time(None, us_listing)
-    except Exception:
-        pass
-
-    return None
-
-
 # Built-in display names for the symbols used by this report. Values in
 # config.TICKER_NAMES override these defaults.
 DEFAULT_TICKER_NAMES = {
@@ -665,12 +475,7 @@ def get_headlines(ticker, limit=5):
 
 
 
-def gather_group(
-    tickers,
-    with_headlines=False,
-    with_earnings_reaction=False,
-    headline_limit=5,
-):
+def gather_group(tickers, with_headlines=False, headline_limit=5):
     rows = []
 
     for ticker in tickers:
@@ -687,26 +492,7 @@ def gather_group(
             "daily": daily,
             "ytd": ytd,
             "headlines": [],
-            "after_hours": None,
-            "earnings_today": None,
         }
-
-        if with_earnings_reaction:
-            row["after_hours"] = get_after_hours(ticker, current)
-            row["earnings_today"] = get_earnings_today(ticker)
-
-            if row["after_hours"]:
-                print(
-                    f"{ticker} after hours: "
-                    f"{row['after_hours']['pct']:+.2f}% "
-                    f"(last trade {row['after_hours']['as_of']})"
-                )
-
-            if row["earnings_today"]:
-                print(
-                    f"{ticker} earnings released today "
-                    f"{row['earnings_today']}"
-                )
 
         if with_headlines:
             yahoo_headlines = get_headlines(ticker, limit=headline_limit)
@@ -734,89 +520,46 @@ def gather_group(
 
     return rows
 
+    # Supplement Yahoo's feed when it returns too little coverage.
+    if len(row["headlines"]) < headline_limit:
+        extra = search_company_news(
+            ticker,
+            limit=headline_limit,
+        )
 
-# Article screening for the Top Market Stories section.
-# Company earnings are covered in the company-by-company review, so the
-# market stories exclude them. "Hourly/weekly earnings" (wage data in the
-# jobs report) is a macro figure and is deliberately not excluded.
+        seen_titles = {
+            h["title"].strip().lower()
+            for h in row["headlines"]
+        }
 
-EARNINGS_TITLE_PATTERN = re.compile(
-    r"(?<!hourly )(?<!weekly )(?<!wage )\bearnings?\b"
-    r"|\beps\b"
-    r"|\bquarterly (results|profit|loss|revenue|sales)\b"
-    r"|\b(first|second|third|fourth)[- ]quarter "
-    r"(results|profit|loss|earnings|revenue|sales)\b"
-    r"|\bq[1-4] (results|profit|loss|earnings|revenue|sales)\b"
-    r"|\b(beats?|tops?|miss|misses) (estimates|expectations|forecasts|views)\b"
-    r"|\b(profit|revenue|sales) (rises|falls|jumps|drops|slumps|surges|beats|misses|tops)\b"
-    r"|\bguidance\b"
-    r"|\b(reports|posts) (results|profit|loss)\b",
-    re.IGNORECASE,
-)
+        for headline in extra:
+            key = headline["title"].strip().lower()
 
-# URL path fragments and headline prefixes that mark opinion/commentary.
-OPINION_URL_MARKERS = (
-    "/opinion",
-    "/commentary",
-    "/breakingviews",
-    "/columnists",
-    "/columnist/",
-    "/column/",
-    "/op-ed",
-    "/oped",
-    "/leaders/",
-)
+            if key not in seen_titles:
+                row["headlines"].append(headline)
+                seen_titles.add(key)
 
-OPINION_TITLE_PREFIXES = (
-    "opinion",
-    "op-ed",
-    "column",
-    "commentary",
-    "breakingviews",
-    "editorial",
-    "viewpoint",
-)
+            if len(row["headlines"]) >= headline_limit:
+                break
 
-# Outlets with well-labelled opinion sections on markets and the economy.
-OPINION_DOMAINS = [
-    "bloomberg.com",
-    "reuters.com",
-    "wsj.com",
-    "ft.com",
-    "economist.com",
-    "project-syndicate.org",
-    "theglobeandmail.com",
-    "financialpost.com",
-    "cnbc.com",
-    "marketwatch.com",
-    "barrons.com",
-]
+        rows.append(row)
 
-# Search snippets are trimmed so a larger candidate pool does not
-# inflate the Groq prompt.
-SNIPPET_CHARS = 700
+    return rows
 
 
-def is_earnings_story(title):
-    return bool(EARNINGS_TITLE_PATTERN.search(title or ""))
+def gather_market_news(limit=10):
+    """
+    Search the current web for major financial-market stories.
 
+    This is deliberately broad rather than ticker-driven. The goal is
+    to surface the day's important investor-relevant stories, similar
+    to a concise financial front page, and then let Groq select the
+    most important distinct stories.
+    """
 
-def is_opinion_piece(url, title):
-    path = urlparse(url or "").path.lower()
-
-    if any(marker in path for marker in OPINION_URL_MARKERS):
-        return True
-
-    lowered = (title or "").strip().lower()
-
-    return any(
-        lowered.startswith(prefix)
-        for prefix in OPINION_TITLE_PREFIXES
+    print(
+        "Gathering market news from the web..."
     )
-
-
-def tavily_news_search(query, days, max_results, include_domains=None):
-    """Run one Tavily news search and return its raw results."""
 
     api_key = getattr(
         config,
@@ -825,187 +568,152 @@ def tavily_news_search(query, days, max_results, include_domains=None):
     )
 
     if not api_key:
-        return []
-
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "search_depth": "advanced",
-        "topic": "news",
-        "days": days,
-        "max_results": max_results,
-        "include_answer": False,
-    }
-
-    if include_domains:
-        payload["include_domains"] = include_domains
-
-    try:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            headers={
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-            print(
-                "Tavily search failed: "
-                f"{response.status_code} "
-                f"{response.text[:500]}"
-            )
-            return []
-
-        return response.json().get("results", []) or []
-
-    except Exception as e:
-        print(
-            f"News search exception: {e}"
-        )
-        return []
-
-
-def gather_market_news(news_limit=15, opinion_limit=5):
-    """
-    Search the current web for major financial-market stories and
-    opinion pieces.
-
-    This is deliberately broad rather than ticker-driven. Earnings
-    stories are screened out. News results come first, followed by
-    opinion candidates; each item carries an is_opinion flag so Groq
-    can pick four news stories and one opinion piece.
-    """
-
-    print(
-        "Gathering market news from the web..."
-    )
-
-    if not getattr(config, "TAVILY_API_KEY", ""):
         print(
             "TAVILY_API_KEY is not configured."
         )
         return []
 
-    today = market_today().isoformat()
+    today = market_today()
 
-    news_queries = [
+    queries = [
         (
             "major financial market news "
-            f"stocks bonds economy today {today}"
+            "stocks bonds economy today "
+            f"{today.isoformat()}"
         ),
         (
             "Wall Street markets Federal Reserve "
-            f"interest rates inflation today {today}"
+            "interest rates inflation today "
+            f"{today.isoformat()}"
         ),
         (
             "major business financial news "
-            f"investors today {today}"
+            "investors today "
+            f"{today.isoformat()}"
         ),
         (
             "oil gold dollar Treasury markets "
-            f"today {today}"
-        ),
-        (
-            "trade policy tariffs geopolitics "
-            f"regulation markets today {today}"
+            f"today {today.isoformat()}"
         ),
     ]
 
-    opinion_queries = [
-        (
-            "opinion column markets economy "
-            f"investors {today}"
-        ),
-        (
-            "commentary Federal Reserve inflation "
-            f"economy outlook opinion {today}"
-        ),
-    ]
-
-    news = []
-    opinions = []
+    results = []
     seen_urls = set()
     seen_titles = set()
-    excluded = []
 
-    def add_results(results):
+    for query in queries:
 
-        for result in results:
+        try:
 
-            title = str(result.get("title", "") or "").strip()
-            url = str(result.get("url", "") or "").strip()
-            content = str(result.get("content", "") or "").strip()
+            response = requests.post(
+                "https://api.tavily.com/search",
+                headers={
+                    "Content-Type":
+                        "application/json",
+                },
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "topic": "news",
+                    "days": 2,
+                    "max_results": limit,
+                    "include_answer": False,
+                },
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+
+                print(
+                    "Tavily search failed: "
+                    f"{response.status_code} "
+                    f"{response.text[:500]}"
+                )
+
+                continue
+
+            data = response.json()
+
+        except Exception as e:
+
+            print(
+                f"News search exception: {e}"
+            )
+
+            continue
+
+        for result in (
+            data.get("results", [])
+        ):
+
+            title = str(
+                result.get(
+                    "title",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            url = str(
+                result.get(
+                    "url",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            content = str(
+                result.get(
+                    "content",
+                    ""
+                )
+                or ""
+            ).strip()
 
             if not title or not url:
                 continue
 
-            title_key = title.lower()
+            title_key = (
+                title.lower()
+            )
 
-            if url in seen_urls or title_key in seen_titles:
+            if (
+                url in seen_urls
+                or title_key in seen_titles
+            ):
                 continue
 
             seen_urls.add(url)
             seen_titles.add(title_key)
 
-            if is_earnings_story(title):
-                excluded.append(title)
-                continue
-
-            opinion = is_opinion_piece(url, title)
-
-            item = {
-                "title": title,
-                "publisher": news_publisher(result),
-                "url": url,
-                "snippet": content[:SNIPPET_CHARS],
-                "is_opinion": opinion,
-            }
-
-            if opinion:
-                opinions.append(item)
-            else:
-                news.append(item)
-
-    for query in news_queries:
-        add_results(
-            tavily_news_search(query, days=2, max_results=10)
-        )
-
-    for query in opinion_queries:
-        add_results(
-            tavily_news_search(
-                query,
-                days=3,
-                max_results=10,
-                include_domains=OPINION_DOMAINS,
+            results.append(
+                {
+                    "title": title,
+                    "publisher": news_publisher(result),
+                    "url": url,
+                    "snippet": content,
+                }
             )
-        )
 
-    results = news[:news_limit] + opinions[:opinion_limit]
+    # Keep the strongest first results while preventing one query
+    # from dominating the entire list.
+    results = results[:limit]
 
     print(
-        f"Market news collected: {len(news[:news_limit])} news, "
-        f"{len(opinions[:opinion_limit])} opinion; "
-        f"{len(excluded)} earnings stories excluded"
+        "Total market news results collected: "
+        f"{len(results)}"
     )
 
-    for title in excluded:
-        print(f"  [excluded: earnings] {title}")
+    for i, result in enumerate(
+        results,
+        start=1,
+    ):
 
-    for i, result in enumerate(results, start=1):
-        label = "Opinion" if result["is_opinion"] else "News"
         print(
-            f"  [{i}] ({label}) "
+            f"  [{i}] "
             f"{result['title']} — "
             f"{result['publisher']}"
-        )
-
-    if not opinions:
-        print(
-            "No opinion pieces found; the review will "
-            "run five news stories instead."
         )
 
     return results
@@ -1465,8 +1173,7 @@ def gather_lookahead():
         + timedelta(days=7)
     )
 
-    # Earnings (strictly after today; anything released today is
-    # reported in the "Reported Today" section instead)
+    # Earnings
 
     tracked_for_earnings = list(
         dict.fromkeys(
@@ -1497,7 +1204,7 @@ def gather_lookahead():
 
                 if (
                     today
-                    < earnings_date
+                    <= earnings_date
                     <= horizon
                 ):
 
@@ -1795,7 +1502,7 @@ def build_ai_summary(
 
         for r in rows:
 
-            line = (
+            lines.append(
                 f"\n{r['ticker']} "
                 f"({r['name']}) | "
                 f"daily "
@@ -1803,30 +1510,6 @@ def build_ai_summary(
                 f"YTD "
                 f"{r['ytd']:+.2f}%"
             )
-
-            after_hours = r.get("after_hours")
-
-            if after_hours:
-                line += (
-                    f" | after hours "
-                    f"{after_hours['pct']:+.2f}% vs close "
-                    f"(last trade {after_hours['as_of']})"
-                )
-            elif is_us_listing(r["ticker"]):
-                line += " | no after-hours trading data"
-            else:
-                line += (
-                    " | no after-hours session "
-                    "(non-US listing)"
-                )
-
-            lines.append(line)
-
-            if r.get("earnings_today"):
-                lines.append(
-                    "  EARNINGS RELEASED TODAY "
-                    f"{r['earnings_today']}"
-                )
 
             if r["headlines"]:
 
@@ -1933,15 +1616,6 @@ def build_ai_summary(
             )
 
             lines.append(
-                "    Type: "
-                + (
-                    "OPINION / COMMENTARY"
-                    if h.get("is_opinion")
-                    else "News"
-                )
-            )
-
-            lines.append(
                 f"    Publisher: "
                 f"{h['publisher']}"
             )
@@ -1965,11 +1639,28 @@ def build_ai_summary(
 
     def fmt_lookahead(lookahead_data):
 
-        # Upcoming earnings are deliberately left out of the prompt: the
-        # forward view covers the broad market only. The earnings
-        # calendar still appears in the email's Looking Ahead lists.
-
         lines = []
+
+        if lookahead_data[
+            "earnings"
+        ]:
+
+            lines.append(
+                "UPCOMING EARNINGS"
+            )
+
+            for earnings in sorted(
+                lookahead_data[
+                    "earnings"
+                ],
+                key=lambda x: x["date"],
+            ):
+
+                lines.append(
+                    f"{earnings['date']}: "
+                    f"{earnings['ticker']} "
+                    f"({earnings['name']})"
+                )
 
         if lookahead_data[
             "macro"
@@ -2122,7 +1813,7 @@ REQUIRED JSON
     "key_question": "<one central investment question>"
   }},
 
-  "looking_ahead": "<3-5 sentence forward view on the broad market, no earnings>",
+  "looking_ahead": "<3-5 sentence forward-looking summary>",
 
   "bottom_line": "<2-4 sentence final assessment>"
 }}
@@ -2135,8 +1826,6 @@ EXECUTIVE SUMMARY
 - Write 4-5 bullets.
 - Summarize the most important developments across equities,
   rates, macro, sectors, factors and cross-asset markets.
-- If a tracked company released earnings after today's close and
-  moved materially after hours, include that reaction.
 - Do not simply repeat every number.
 - Each bullet should communicate a meaningful takeaway.
 
@@ -2155,40 +1844,12 @@ TICKER REVIEW
   that the move remains unexplained by the sources reviewed.
 - Do not infer a cause from the price movement alone.
 - Distinguish confirmed catalysts from plausible but unverified
-  explanations.
-- Do not fabricate company events, facts or sources.
+  explanations.- Do not fabricate company events, facts or sources.
 - Do not spend the entire note repeating the daily percentage move.
 
-AFTER-HOURS AND EARNINGS TIMING
-- The "after hours" figure compares the last after-hours trade with
-  the official close. It is NOT part of the daily return.
-- If a company released earnings AFTER THE CLOSE today, lead its note
-  with the results and the after-hours reaction. Label the move
-  clearly as after-hours and preliminary: trading is thin and the
-  reaction is only confirmed by the next regular session.
-  Do not describe the regular-session move as a reaction to results
-  that were released after the close.
-- If a company released earnings BEFORE THE OPEN or during market
-  hours, the daily move already reflects the market's reaction.
-- If a US-listed stock moved roughly 2% or more after hours without
-  an earnings release, mention it and say whether the supplied
-  sources explain it.
-- Non-US listings have no after-hours session. If such a company
-  released results after its exchange closed, say the share-price
-  reaction will show in the next session rather than guessing it.
-
 MARKET STORIES
-- Select exactly 5 DISTINCT items from the MARKET HEADLINES list:
-  4 news stories (Type: News) and 1 opinion piece
-  (Type: OPINION / COMMENTARY), with the opinion piece last.
-- If no OPINION / COMMENTARY item is supplied, select 5 news stories
-  instead. Never present a news item as opinion, or an opinion item
-  as news.
-- EXCLUDE any item whose main subject is corporate earnings:
-  quarterly results, earnings season, guidance, EPS or analyst
-  estimates. Earnings are covered elsewhere in the review. An item
-  may mention earnings in passing only if its main subject is
-  something else.
+- Select 3-5 of the most important DISTINCT stories from the supplied
+  market-news search results.
 - Think of this section as a concise morning/evening market briefing
   similar in spirit to the front page of Bloomberg, Financial Times,
   CNBC, or Reuters.
@@ -2207,38 +1868,27 @@ MARKET STORIES
 - Do not simply describe today's market performance. The Market
   Dashboard already provides those numbers.
 - Each summary should be roughly 180-250 words.
-- For news stories: explain what happened, the relevant context, why
-  investors care, and what could matter next.
-- For the opinion piece: summarize the author's central argument and
-  the evidence offered, attributing it clearly (for example "the
-  columnist argues..."). Never state the author's view as fact.
-  Explain why the argument matters for investors and identify the
-  key assumption it depends on.
+- Explain what happened, the relevant context, why investors care,
+  and what could matter next.
 - Do not duplicate stories that are essentially about the same event.
 - Use only information contained in the supplied search results.
 - Do not invent facts, quotes, events, sources or explanations that
   are not reasonably supported by the supplied material.
 - source_index MUST correspond to the numbered MARKET HEADLINES list.
 - If the supplied search results do not contain enough reliable material
-  for five distinct items, return only the number that can be
-  supported. Never manufacture additional stories.
+  for three distinct stories, return only the number of stories that
+  can be supported. Never manufacture additional stories.
 INVESTMENT IMPLICATIONS
 - Bull case: strongest arguments supporting current conditions.
 - Bear case: strongest risks or challenges.
 - Key question: one specific question that should guide monitoring.
 - These should be analytical rather than repetitive.
 
-LOOKING AHEAD (FORWARD VIEW)
-- Focus only on the broad market: what today's moves in equities,
-  rates, sectors, factors and cross-asset markets imply for the
-  days ahead, and which macro developments could change that picture.
-- Do NOT mention earnings at all: no company results, earnings
-  season, upcoming reports, guidance or estimates. Do not discuss
-  individual companies.
-- Mention specific macro developments (central banks, economic data,
-  policy, geopolitics) only when they appear in the supplied data
-  or headlines.
-- Explain what matters and why, rather than providing a calendar.
+LOOKING AHEAD
+- Mention specific upcoming tracked-company earnings where available.
+- Mention specific macro developments only when visible in the
+  supplied lookahead data.
+- Explain what matters and why, rather than providing only a calendar.
 - Be concrete rather than generic.
 
 BOTTOM LINE
@@ -2250,7 +1900,7 @@ BOTTOM LINE
 
     parsed = _groq_call(
         prompt,
-        max_tokens=8000,
+        max_tokens=6500,
         temperature=0.3,
     )
 
@@ -2369,21 +2019,14 @@ BOTTOM LINE
         or []
     )
 
-    # The story type comes from the source article itself, not from the
-    # model, so a news piece can never be labelled as opinion. Any
-    # earnings story the model selects anyway is dropped, and the final
-    # list is at most four news stories plus one opinion piece (or five
-    # news stories when no opinion piece was available).
-
     stories = []
-    opinion_story = None
 
     if isinstance(
         stories_raw,
         list,
     ):
 
-        for story in stories_raw:
+        for story in stories_raw[:5]:
 
             if not isinstance(
                 story,
@@ -2391,52 +2034,28 @@ BOTTOM LINE
             ):
                 continue
 
-            title = str(
-                story.get("title") or ""
-            ).strip()
+            stories.append(
+                {
+                    "title": str(
+                        story.get(
+                            "title"
+                        )
+                        or ""
+                    ).strip(),
 
-            summary = str(
-                story.get("summary") or ""
-            ).strip()
+                    "summary": str(
+                        story.get(
+                            "summary"
+                        )
+                        or ""
+                    ).strip(),
 
-            source_index = story.get(
-                "source_index"
+                    "source_index":
+                        story.get(
+                            "source_index"
+                        ),
+                }
             )
-
-            source = None
-
-            if (
-                isinstance(source_index, int)
-                and 1 <= source_index <= len(market_news)
-            ):
-                source = market_news[source_index - 1]
-
-            if is_earnings_story(title) or (
-                source and is_earnings_story(source.get("title"))
-            ):
-                print(f"Dropped earnings story: {title}")
-                continue
-
-            entry = {
-                "title": title,
-                "summary": summary,
-                "source_index": source_index,
-                "is_opinion": bool(
-                    source and source.get("is_opinion")
-                ),
-            }
-
-            if entry["is_opinion"]:
-                if opinion_story is None:
-                    opinion_story = entry
-                continue
-
-            stories.append(entry)
-
-    stories = stories[: 4 if opinion_story else 5]
-
-    if opinion_story:
-        stories.append(opinion_story)
 
     # Normalize investment implications
 
@@ -2565,7 +2184,6 @@ def format_pct(value):
 def build_quote_table(
     rows,
     include_price=False,
-    include_after_hours=False,
 ):
     """Build HTML tables for indices, tickers, and portfolio holdings."""
 
@@ -2592,14 +2210,6 @@ def build_quote_table(
 
     html.append(
         "<th>Daily</th>"
-    )
-
-    if include_after_hours:
-        html.append(
-            "<th>After Hours</th>"
-        )
-
-    html.append(
         "<th>YTD</th>"
         "</tr>"
         "</thead>"
@@ -2624,19 +2234,9 @@ def build_quote_table(
             f"</td>"
         )
 
-        name_html = html_escape(row["name"])
-
-        if row.get("earnings_today"):
-            name_html += (
-                '<br><span class="tag">'
-                "Earnings released today "
-                f"{html_escape(row['earnings_today'])}"
-                "</span>"
-            )
-
         html.append(
             f"<td class=\"name\">"
-            f"{name_html}"
+            f"{html_escape(row['name'])}"
             f"</td>"
         )
 
@@ -2655,26 +2255,6 @@ def build_quote_table(
             f"</td>"
         )
 
-        if include_after_hours:
-
-            after_hours = row.get("after_hours")
-
-            if after_hours:
-                html.append(
-                    f"<td class=\"number "
-                    f"{pct_class(after_hours['pct'])}\">"
-                    f"{format_pct(after_hours['pct'])}"
-                    f"</td>"
-                )
-            elif is_us_listing(row["ticker"]):
-                html.append(
-                    "<td class=\"number neutral\">—</td>"
-                )
-            else:
-                html.append(
-                    "<td class=\"number neutral\">n/a</td>"
-                )
-
         html.append(
             f"<td class=\"number "
             f"{pct_class(ytd)}\">"
@@ -2690,17 +2270,6 @@ def build_quote_table(
         "</tbody>"
         "</table>"
     )
-
-    if include_after_hours:
-        html.append(
-            '<p class="table-note">'
-            "After Hours compares the last after-hours trade "
-            "(up to 8:00 PM ET) with the official 4:00 PM close. "
-            "US listings only; n/a means the listing has no "
-            "after-hours session. Not included in the Daily, YTD "
-            "or portfolio figures."
-            "</p>"
-        )
 
     return "".join(html)
 
@@ -3092,10 +2661,7 @@ def build_market_stories(
         )
 
         if title:
-            if story.get("is_opinion"):
-                html += f"<h2>Opinion: {title}</h2>"
-            else:
-                html += f"<h2>{title}</h2>"
+            html += f"<h2>{title}</h2>"
 
         if (
             isinstance(source_index, int)
@@ -3141,45 +2707,6 @@ def build_paragraph(
         f"<p>{html_escape(p)}</p>"
         for p in paragraphs
     )
-
-
-def build_reported_today(tickers):
-    """List tracked companies that released earnings today."""
-
-    reported = [
-        row for row in tickers
-        if row.get("earnings_today")
-    ]
-
-    if not reported:
-        return ""
-
-    html = "<h2>Reported Today</h2><ul>"
-
-    for row in reported:
-
-        item = (
-            f"<strong>{html_escape(row['ticker'])}</strong> "
-            f"({html_escape(row['name'])}): released "
-            f"{html_escape(row['earnings_today'])}"
-        )
-
-        after_hours = row.get("after_hours")
-
-        if after_hours:
-            item += (
-                "; after hours "
-                f"<span class=\"{pct_class(after_hours['pct'])}\">"
-                f"{format_pct(after_hours['pct'])}"
-                "</span> "
-                f"(last trade {html_escape(after_hours['as_of'])})"
-            )
-
-        html += f"<li>{item}</li>"
-
-    html += "</ul>"
-
-    return html
 
 
 # Email composition
@@ -3385,19 +2912,6 @@ li {{
     color: #000000;
 }}
 
-.tag {{
-    font-size: 12px;
-    font-style: italic;
-    color: #555555;
-}}
-
-.table-note {{
-    font-size: 12px;
-    color: #555555;
-    margin-top: -16px;
-    margin-bottom: 20px;
-}}
-
 .ticker-review {{
     margin-bottom: 26px;
 }}
@@ -3533,7 +3047,6 @@ YTD
 {build_quote_table(
     tickers,
     include_price=True,
-    include_after_hours=True,
 )}
 
 <h2>Company-by-Company Review</h2>
@@ -3612,9 +3125,6 @@ YTD
 
 <h1>6. Looking Ahead</h1>
 
-{build_reported_today(
-    tickers
-)}
 
 <h2>Upcoming Earnings</h2>
 """
@@ -3825,7 +3335,6 @@ def main():
     tickers = gather_group(
         config.TICKERS,
         with_headlines=True,
-        with_earnings_reaction=True,
     )
 
     print(
@@ -3876,7 +3385,9 @@ def main():
     )
 
     market_news = (
-        gather_market_news()
+        gather_market_news(
+            limit=10
+        )
     )
 
     print(
