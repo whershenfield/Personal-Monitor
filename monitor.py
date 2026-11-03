@@ -825,6 +825,63 @@ def format_cap(value):
     return f"${value / 1e6:.0f}M"
 
 
+def fmt_clock(dt):
+    """'6:42 PM ET' style label for an aware datetime."""
+    if not dt:
+        return ""
+    return dt.astimezone(MARKET_TZ).strftime("%I:%M %p ET").lstrip("0")
+
+
+def _after_hours_quote(ticker, regular_close):
+    """
+    Latest after-hours (post-4:00 PM ET) price for today, and its change
+    versus today's regular-session close. Returns None if nothing has
+    traded after the close yet or the data isn't available.
+    """
+    if not regular_close or "^" in ticker:
+        return None
+    today = market_today()
+    stock = yf.Ticker(ticker)
+    price = stamp = None
+
+    # Primary source: one-minute bars including extended hours.
+    try:
+        intra = stock.history(
+            period="5d", interval="1m", prepost=True, auto_adjust=False
+        )
+    except Exception as e:
+        print(f"After-hours fetch failed for {ticker}: {e}")
+        intra = None
+    if intra is not None and not intra.empty and "Close" in intra:
+        intra = intra.dropna(subset=["Close"])
+        for ts, close in zip(intra.index, intra["Close"].tolist()):
+            local = (ts.tz_convert(MARKET_TZ) if ts.tzinfo is not None
+                     else ts.tz_localize(MARKET_TZ))
+            if local.date() == today and local.hour >= 16:
+                price, stamp = float(close), local.to_pydatetime()
+
+    # Fallback: Yahoo's quote summary, which carries a post-market price.
+    if price is None:
+        try:
+            info = stock.info or {}
+            p, t = info.get("postMarketPrice"), info.get("postMarketTime")
+            if p and t:
+                local = datetime.fromtimestamp(int(t), tz=timezone.utc)
+                local = local.astimezone(MARKET_TZ)
+                if local.date() == today and local.hour >= 16:
+                    price, stamp = float(p), local
+        except Exception:
+            pass
+
+    if price is None:
+        return None
+    return {
+        "price": price,
+        "change": (price - regular_close) / regular_close * 100,
+        "as_of": stamp,
+    }
+
+
 def fetch_earnings_calendar(day):
     """All companies reporting on a given date (Nasdaq earnings calendar)."""
     try:
@@ -890,17 +947,44 @@ def gather_recent_earnings():
     for c in candidates:
         _EXTRA_NAMES.setdefault(c["ticker"], c["name"])
         quote = get_quote(c["ticker"])
+        fresh = quote is not None and not quote["stale"]
+
+        # Regular-session move today, and any trading since the 4 PM close.
+        c["session"] = quote["daily"] if fresh else None
+        ah = _after_hours_quote(c["ticker"], quote["price"] if fresh else None)
+        c["after_hours"] = ah["change"] if ah else None
+        c["after_hours_time"] = ah["as_of"] if ah else None
+
         reported_after_today_close = (
             c["date"] == today and c["timing"] == "After close"
         )
         if reported_after_today_close:
-            c["reaction"] = None
-            c["reaction_note"] = "Reported after today's close; reaction pending"
-        elif quote:
-            c["reaction"] = quote["daily"]
-            c["reaction_note"] = f"Stock {format_pct(quote['daily'])} today"
+            # The session move happened before the numbers came out, so
+            # the after-hours move is the real earnings reaction.
+            c["reaction"] = c["after_hours"]
+            c["reaction_source"] = "after_hours"
+            if ah:
+                c["reaction_note"] = (
+                    f"Reported after today's close; stock "
+                    f"{format_pct(ah['change'])} in after-hours trading "
+                    f"as of {fmt_clock(ah['as_of'])} (preliminary, thin volume)"
+                )
+            else:
+                c["reaction_note"] = (
+                    "Reported after today's close; no after-hours trades "
+                    "recorded yet"
+                )
+        elif c["session"] is not None:
+            c["reaction"] = c["session"]
+            c["reaction_source"] = "session"
+            c["reaction_note"] = f"Stock {format_pct(c['session'])} today"
+            if ah:
+                c["reaction_note"] += (
+                    f", {format_pct(ah['change'])} after hours"
+                )
         else:
             c["reaction"] = None
+            c["reaction_source"] = None
             c["reaction_note"] = "Price reaction unavailable"
 
         news = tavily_search(
@@ -1419,6 +1503,11 @@ RULES
   that clearly reported in the last day; their cites refer to that list.
 - Each blurb: EPS and revenue versus expectations, guidance, the key
   business driver(s), and the stock reaction given above.
+- For companies that reported after today's close, the after-hours move
+  is the earnings reaction; today's regular-session move happened before
+  the results and should not be described as a reaction to them. Call
+  after-hours moves early or preliminary, since volume is thin and they
+  can change by the next open.
 - Use only numbers and facts in the supplied material. If coverage is
   thin, say what is known and that full details weren't available.
 - Ignore headlines not about that company's own results.
@@ -2045,6 +2134,62 @@ def build_market_stories(market_news, ai):
     return html
 
 
+def build_earnings_table(recent):
+    """
+    At-a-glance table of everyone who just reported, with the regular
+    session move and the after-hours move side by side. The figure that
+    reflects the earnings reaction is bolded.
+    """
+    companies = recent.get("companies", [])
+    if not companies:
+        return ""
+
+    def pct_cell(value, is_reaction):
+        if value is None:
+            return '<td class="number">—</td>'
+        cls = pct_class(value) + (" reaction" if is_reaction else "")
+        return f'<td class="number {cls}">{format_pct(value)}</td>'
+
+    html = [
+        '<table class="data-table"><thead><tr>'
+        "<th>Company</th><th>Reported</th><th>EPS vs. Est.</th>"
+        "<th>Today's Session</th><th>After Hours</th>"
+        "</tr></thead><tbody>"
+    ]
+    for c in companies:
+        if c.get("eps_actual") and c.get("eps_forecast"):
+            eps = f"{c['eps_actual']} vs. {c['eps_forecast']}"
+        elif c.get("eps_forecast"):
+            eps = f"Est. {c['eps_forecast']}"
+        else:
+            eps = "—"
+        source = c.get("reaction_source")
+        html.append(
+            "<tr>"
+            f'<td class="name">{html_escape(c["name"])} '
+            f'<span class="ticker">({html_escape(c["ticker"])})</span></td>'
+            f'<td>{html_escape(c["date"].strftime("%b %d"))}, '
+            f'{html_escape(c["timing"].lower())}</td>'
+            f'<td class="number">{html_escape(eps)}</td>'
+            + pct_cell(c.get("session"), source == "session")
+            + pct_cell(c.get("after_hours"), source == "after_hours")
+            + "</tr>"
+        )
+    html.append("</tbody></table>")
+
+    stamps = [c["after_hours_time"] for c in companies
+              if c.get("after_hours_time")]
+    as_of = f" After-hours prices as of {fmt_clock(max(stamps))}." if stamps else ""
+    html.append(
+        '<p class="note">Bold marks the earnings reaction: today\'s session '
+        "for companies that reported before today's open or after "
+        "yesterday's close, and after-hours trading for companies that "
+        f"reported after today's close.{as_of} After-hours moves trade on "
+        "thin volume and can shift meaningfully by the next open.</p>"
+    )
+    return "".join(html)
+
+
 def build_earnings_recap(recent, earnings_notes):
     if not earnings_notes:
         if recent.get("companies"):
@@ -2154,6 +2299,7 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
                     overflow-wrap: break-word; }
 .data-table .number { text-align: right; white-space: nowrap;
                       font-variant-numeric: tabular-nums; }
+.data-table .reaction { font-weight: bold; }
 .positive { color: #008000; }
 .negative { color: #b00000; }
 .neutral { color: #000; }
@@ -2234,6 +2380,7 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 {build_market_stories(market_news, ai)}
 
 <h1>5. Earnings Recap</h1>
+{build_earnings_table(recent_earnings)}
 {build_earnings_recap(recent_earnings, earnings_notes)}
 
 <h1>6. Investment Implications</h1>
