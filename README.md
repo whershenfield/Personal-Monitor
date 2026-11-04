@@ -10,7 +10,7 @@ An automated end-of-day market report, delivered by email after the U.S. close. 
 4. **Top Market Stories**: four of the day's most important non-earnings stories plus one opinion piece, each with a source link.
 5. **Earnings Recap**: the largest companies that just reported, with results versus expectations and the stock's reaction, including after-hours moves for after-close reporters.
 6. **Investment Implications**: bull case, bear case and a key question to monitor.
-7. **Looking Ahead**: previews of major earnings in the next two business days and macro developments to watch.
+7. **Looking Ahead**: previews of major earnings in the next two business days, macro developments to watch, and a forward view on the broader market outlook.
 8. **Bottom Line**: whether the day was constructive, mixed or defensive, and what matters next.
 
 ## How it works
