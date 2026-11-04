@@ -1838,8 +1838,7 @@ def build_earnings_previews(upcoming):
         lines.append(
             f"\n{e['ticker']} ({e['name']}){tracked} | reports "
             f"{e['date'].strftime('%a %b %d')} {e['timing']} | mkt cap "
-            f"{format_cap(e['market_cap'])} | consensus EPS "
-            f"{e.get('eps_forecast') or 'n/a'}"
+            f"{format_cap(e['market_cap'])}"
         )
         if e.get("headlines"):
             lines += _fmt_headline_lines(e["headlines"], snippet_chars=400)
@@ -1849,21 +1848,22 @@ def build_earnings_previews(upcoming):
     prompt = f"""
 You are writing the "Upcoming Earnings" section of a professional daily
 market review dated {_report_date()}. For each company reporting in the
-next two business days, write a short preview of what investors should
-watch.
+next two business days, name the single most important thing investors
+should be looking for.
 
 COMPANIES:
 {chr(10).join(lines)}
 
 Return JSON exactly in this shape:
-{{"previews": [{{"ticker": "MSFT", "blurb": "2-4 sentences",
+{{"previews": [{{"ticker": "MSFT", "blurb": "one sentence",
   "cites": [1]}}]}}
 
 RULES
 - Write a preview for EVERY company listed.
-- Each blurb names the 2-3 specific things that will move the stock:
-  the key segment or metric, guidance, margins, demand signals, and any
-  issue raised in the preview coverage. Mention the consensus EPS if given.
+- Each blurb is ONE sentence naming the ONE thing most likely to move
+  the stock (a specific segment, metric, guidance item or issue raised in
+  the preview coverage) and briefly why it matters. Don't list several
+  items, and don't mention EPS estimates.
 - Use preview coverage where supplied and cite it by number. Without
   coverage, you may rely on the company's well-known business drivers,
   but never invent figures, estimates or events.
@@ -2632,8 +2632,6 @@ def build_upcoming_earnings(upcoming, previews):
         details = [f"{e['date'].strftime('%a %b %d')}, {e['timing'].lower()}"]
         if e.get("market_cap"):
             details.append(f"Mkt cap {format_cap(e['market_cap'])}")
-        if e.get("eps_forecast"):
-            details.append(f"Consensus EPS {e['eps_forecast']}")
         html += f'<p class="note">{html_escape(" · ".join(details))}</p>'
 
         preview = previews.get(e["ticker"].upper())
