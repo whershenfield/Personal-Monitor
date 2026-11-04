@@ -2515,12 +2515,13 @@ def _pct_span(value, bold=False):
     return f'<{tag} class="{pct_class(value)}">{format_pct(value)}</{tag}>'
 
 
-def build_after_hours_box(c):
+def build_after_hours_box(c, summary=""):
     """
     Shaded box for one company: the move that reflects the earnings
     reaction as the headline (after-hours for companies that reported
     after today's close, regular session otherwise), a small price table,
-    and a plain-English note on how to read it.
+    and the summary of the results underneath. If no summary is available,
+    a plain-English note on how to read the prices is shown instead.
     """
     ah = c.get("after_hours")
     session = c.get("session")
@@ -2574,7 +2575,13 @@ def build_after_hours_box(c):
     else:
         note = "Price data for today was unavailable."
 
-    html += f'<p class="ah-note">{html_escape(note)}</p></div>'
+    # The summary of the results sits inside the shaded box with the price
+    # table; the note on how to read the prices always goes underneath it.
+    summary = (summary or "").strip()
+    if summary:
+        html += f'<p class="blurb ah-summary">{html_escape(summary)}</p>'
+    html += "</div>"
+    html += f'<p class="ah-note ah-note-below">{html_escape(note)}</p>'
     return html
 
 
@@ -2608,11 +2615,11 @@ def build_earnings_recap(recent, earnings_notes):
             html += (
                 f'<p class="note">{html_escape(" · ".join(details))}</p>'
             )
-            html += build_after_hours_box(c)
+            html += build_after_hours_box(c, e.get("blurb"))
             headlines = c["headlines"]
         else:
             headlines = recent.get("general", [])
-        html += f'<p class="blurb">{html_escape(e["blurb"])}</p>'
+            html += f'<p class="blurb">{html_escape(e["blurb"])}</p>'
         cited = _cited(headlines, e["cites"])
         if cited:
             html += "".join(build_source_link(h) for h in cited)
@@ -2704,6 +2711,8 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
                white-space: nowrap; font-variant-numeric: tabular-nums;
                font-family: "Times New Roman", Times, serif; }
 .ah-note { font-size: 12px; color: #444; margin: 0; }
+.ah-summary { margin: 10px 0 0 0; }
+.ah-note-below { margin: -10px 0 16px 0; }
 .blurb { font-size: 16px; line-height: 1.6; color: #000;
          margin-bottom: 10px; }
 .footer { margin-top: 38px; padding-top: 10px; border-top: 1px solid #999;
