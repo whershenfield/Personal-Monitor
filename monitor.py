@@ -290,7 +290,6 @@ def _fetch_quote(ticker):
 
     return {
         "price": current,
-        "prev_close": prev_close,
         "daily": (current - prev_close) / prev_close * 100,
         "ytd": (current - ytd_base) / ytd_base * 100,
         "as_of": as_of,
@@ -1234,8 +1233,7 @@ def gather_recent_earnings():
         # 4 PM close.
         c["session"] = quote["daily"] if fresh else None
         c["close"] = quote["price"] if fresh else None
-        c["prev_close"] = quote.get("prev_close") if fresh else None
-        ah =_after_hours_quote(c["ticker"], c["close"])
+        ah = _after_hours_quote(c["ticker"], c["close"])
         c["after_hours"] = ah["change"] if ah else None
         c["after_hours_price"] = ah["price"] if ah else None
         c["after_hours_time"] = ah["as_of"] if ah else None
@@ -2232,8 +2230,15 @@ RULES
 - bull_case / bear_case: the 3 strongest arguments each way, analytical
   rather than repetitive. Each point is a plain string.
 - key_question: one specific question to guide monitoring.
-- looking_ahead: the most important upcoming earnings and macro items
-  above and what to watch in each. Be concrete.
+- looking_ahead: the broader market outlook for the days and weeks ahead,
+  NOT a preview of individual companies. Do not mention any specific
+  company's upcoming earnings report (those are covered separately).
+  Focus on: the direction of rates and Fed expectations, the macro data
+  and policy themes in the headlines above, what today's sector, factor
+  and cross-asset moves suggest about market leadership and risk
+  appetite, and the main risks that could change the picture. Say what
+  would confirm or challenge the current trend. Be concrete, and don't
+  invent dates or scheduled events that aren't in the data above.
 - bottom_line: was today constructive, mixed or defensive and why, and
   the single most important thing to monitor next.
 - Use only the data above; don't invent facts.
@@ -2521,9 +2526,9 @@ def build_after_hours_box(c, summary=""):
     """
     Shaded box for one company: the move that reflects the earnings
     reaction as the headline (after-hours for companies that reported
-    after today's close, regular session otherwise), a row of prices whose
-    bold "Change" matches the headline, and the summary of the results.
-    A plain-English note on how to read the prices sits below the box.
+    after today's close, regular session otherwise), a small price table,
+    and the summary of the results underneath. If no summary is available,
+    a plain-English note on how to read the prices is shown instead.
     """
     ah = c.get("after_hours")
     session = c.get("session")
@@ -2538,37 +2543,18 @@ def build_after_hours_box(c, summary=""):
     html = '<div class="ah-box">'
     html += f'<p class="ah-title">{label}: {headline}</p>'
 
-    # Row of numbers under the headline. The bold "Change" column is always
-    # the same move as the headline; the other timing's move sits to the
-    # right for context. Missing values show as a dash.
-    def _px(v):
-        return f"{v:.2f}" if isinstance(v, (int, float)) else "—"
-
-    ah_time = (html_escape(fmt_clock(c.get("after_hours_time")))
-               if c.get("after_hours_time") else "—")
-    if after_close:
-        cols = [
-            ("Today's Close", _px(c.get("close"))),
-            ("After-Hours Price", _px(c.get("after_hours_price"))),
-            ("Change", _pct_span(ah, bold=True)),
-            ("Last Trade", ah_time),
-            ("Regular Session Today", _pct_span(session)),
-        ]
-    else:
-        cols = [
-            ("Previous Close", _px(c.get("prev_close"))),
-            ("Today's Close", _px(c.get("close"))),
-            ("Change", _pct_span(session, bold=True)),
-            ("After-Hours Price", _px(c.get("after_hours_price"))),
-            ("After-Hours Change", _pct_span(ah)),
-        ]
-    if c.get("close") is not None:
+    if ah is not None:
         html += (
             '<table class="ah-table"><thead><tr>'
-            + "".join(f"<th>{h}</th>" for h, _ in cols)
-            + "</tr></thead><tbody><tr>"
-            + "".join(f"<td>{v}</td>" for _, v in cols)
-            + "</tr></tbody></table>"
+            "<th>Today's Close</th><th>After-Hours Price</th><th>Change</th>"
+            "<th>Last Trade</th><th>Regular Session Today</th>"
+            "</tr></thead><tbody><tr>"
+            f'<td>{c["close"]:.2f}</td>'
+            f'<td>{c["after_hours_price"]:.2f}</td>'
+            f"<td>{_pct_span(ah, bold=after_close)}</td>"
+            f'<td>{html_escape(fmt_clock(c.get("after_hours_time")))}</td>'
+            f"<td>{_pct_span(session, bold=not after_close)}</td>"
+            "</tr></tbody></table>"
         )
 
     thin = ("After-hours trading is thin, so the price can shift by "
@@ -2580,15 +2566,17 @@ def build_after_hours_box(c, summary=""):
     elif after_close:
         note = ("Results came out after today's close, but no after-hours "
                 "trades were available, so the market's first reaction will "
-                "show at tomorrow's open. The regular-session move happened "
-                "before the report.")
+                "show at tomorrow's open.")
+        if session is not None:
+            note += (f" Regular session today: {format_pct(session)} "
+                     "(before the report).")
     elif ah is not None:
         note = ("Results were already out during today's session, so the "
                 "regular-session move is the main reaction. The after-hours "
                 f"change reflects trading since the close. {thin}")
     elif session is not None:
         note = ("Results were already out during today's session, so the "
-                "regular-session move is the main "
+                f"regular-session move ({format_pct(session)}) is the main "
                 "reaction. No after-hours trades were recorded since the "
                 "close.")
     else:
