@@ -35,4 +35,5 @@ jobs:
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN_GITHUB: ${{ secrets.GIST_TOKEN_GITHUB }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
         run: python monitor.py
