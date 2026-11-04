@@ -654,12 +654,51 @@ def gather_benchmarks(ticker):
 # Headlines about a company's results are covered in the Earnings Recap,
 # so they're kept out of Top Market Stories.
 _EARNINGS_TITLE = re.compile(
-    r"earnings|quarterly (?:results|profit|revenue|sales|loss)"
-    r"|\b(?:first|second|third|fourth)[- ]quarter "
-    r"(?:results|profit|revenue|sales|earnings|loss)"
-    r"|\bq[1-4] (?:results|earnings|profit|revenue|sales)"
-    r"|\beps\b|(?:beats?|miss(?:es)?|tops?) (?:estimates|expectations|forecasts)"
-    r"|(?:raises|cuts|lowers|reaffirms) (?:its |full-year |annual )?(?:guidance|outlook|forecast)",
+    r"earnings|\beps\b"
+    r"|(?:raises?|raised|cuts?|lowers?|lowered|reaffirms?|boosts?|hikes?|"
+    r"trims?|slashes|withdraws?|maintains?) (?:(?:its|their|full-year|"
+    r"annual|sales|profit|revenue|\d{4}) ){0,2}(?:guidance|outlook|forecast)"
+    r"|(?:strong|weak|solid|record|blowout|disappointing|upbeat|downbeat|"
+    r"mixed|soft|stellar|dismal) (?:quarter|results)"
+    r"|(?:profit|revenue|net income) (?:jumps?|rises?|falls?|drops?|slumps?|"
+    r"surges?|soars?|beats?|misses?|tops?|declines?|grows?|climbs?|slides?)"
+    r"|results? (?:beats?|miss(?:es)?|tops?|disappoints?)"
+    r"|ahead of (?:its |their )?(?:results|report)"
+    r"|(?:to |will )report (?:results|earnings)",
+    re.IGNORECASE,
+)
+# "Beats estimates" is earnings language unless the headline is about an
+# economic data release (jobs, inflation, GDP and so on).
+_BEAT_MISS = re.compile(
+    r"(?:beats?|miss(?:es|ed)?|tops?|topped|exceeds?|exceeded|lags?)"
+    r" (?:[\w'.]+ ){0,2}(?:estimates|expectations|forecasts|consensus)",
+    re.IGNORECASE,
+)
+_MACRO_DATA = re.compile(
+    r"\b(?:jobs?|payrolls?|employment|unemployment|jobless|inflation|cpi|"
+    r"ppi|pce|gdp|economy|economic|retail sales|pmi|housing|home sales|"
+    r"consumer confidence|sentiment|wages|claims|data|deficit|trade "
+    r"balance|exports|imports|factory|manufacturing|services)\b",
+    re.IGNORECASE,
+)
+# "Quarter"/"Q3" only counts as earnings alongside a results word, so
+# macro items like "third-quarter GDP" stay in.
+_QUARTER = re.compile(r"\bquarter(?:ly)?\b|\bq[1-4]\b", re.IGNORECASE)
+_RESULTS_WORDS = re.compile(
+    r"\b(?:results|profits?|revenues?|sales|loss(?:es)?|margins?|"
+    r"guidance)\b",
+    re.IGNORECASE,
+)
+# Tell-tale phrases near the top of an article's summary, for stories
+# whose headline doesn't mention results (e.g. "Shares slide despite
+# strong quarter").
+_EARNINGS_SNIPPET = re.compile(
+    r"reported (?:its )?(?:first|second|third|fourth|fiscal)[- ]quarter"
+    r"|quarterly (?:results|earnings|profit|revenue)"
+    r"|earnings per share|adjusted (?:earnings|eps)"
+    r"|(?:beat|missed|topped) (?:analysts'? |wall street )?"
+    r"(?:estimates|expectations|forecasts)"
+    r"|after (?:the company )?report(?:ed|ing) (?:results|earnings)",
     re.IGNORECASE,
 )
 
@@ -672,7 +711,16 @@ _OPINION_TITLE = re.compile(r"^\s*(opinion|column|commentary|view)\s*[:|]",
 
 
 def is_earnings_story(headline):
-    return bool(_EARNINGS_TITLE.search(headline.get("title", "")))
+    """True if a story is mainly about a company's results."""
+    title = headline.get("title", "") or ""
+    if _EARNINGS_TITLE.search(title):
+        return True
+    if _BEAT_MISS.search(title) and not _MACRO_DATA.search(title):
+        return True
+    if _QUARTER.search(title) and _RESULTS_WORDS.search(title):
+        return True
+    lead = (headline.get("snippet") or "")[:300]
+    return bool(_EARNINGS_SNIPPET.search(lead))
 
 
 def looks_like_opinion(headline):
@@ -680,7 +728,7 @@ def looks_like_opinion(headline):
                 or _OPINION_TITLE.search(headline.get("title", "")))
 
 
-def gather_market_news(limit=14, opinion_limit=6):
+def gather_market_news(limit=20, opinion_limit=8):
     """
     Today's major financial-market stories, minus earnings coverage,
     plus a separate pool of opinion and commentary pieces.
@@ -694,6 +742,7 @@ def gather_market_news(limit=14, opinion_limit=6):
         f"major business financial news investors {today}",
         f"oil gold dollar Treasury markets {today}",
         f"economy policy trade geopolitics markets news {today}",
+        f"central banks currencies credit markets global economy {today}",
     ]
     results = []
     for query in queries:
@@ -713,6 +762,7 @@ def gather_market_news(limit=14, opinion_limit=6):
     opinion_queries = [
         f"opinion column markets economy investors {today}",
         f"commentary analysis Wall Street Fed economy columnist {today}",
+        f"Bloomberg Opinion Breakingviews FT columnist markets economy {today}",
     ]
     opinions = list(found_opinion)
     for query in opinion_queries:
@@ -1844,10 +1894,9 @@ def _parse_stories(parsed, market_news):
             title = market_news[idx - 1]["title"]
         # The source list decides what's opinion, not the model's label.
         kind = market_news[idx - 1].get("kind", "news") if valid else "news"
-        source_title = market_news[idx - 1]["title"] if valid else ""
-        if kind != "opinion" and (
-                is_earnings_story({"title": title})
-                or is_earnings_story({"title": source_title})):
+        source = market_news[idx - 1] if valid else {}
+        if (is_earnings_story({"title": title})
+                or (source and is_earnings_story(source))):
             print(f"Dropping earnings story from Top Stories: {title}")
             continue
         stories.append({"title": title, "summary": summary,
@@ -1908,7 +1957,10 @@ RULES
   in rates/currencies/commodities/credit, major industry or corporate news.
 - NO earnings stories. Skip anything about a company's quarterly results,
   EPS, revenue versus estimates, guidance, or an upcoming report, even if
-  it seems important. Earnings are covered elsewhere in the review.
+  it seems important. Also skip market wraps or roundups driven mainly by
+  earnings. Earnings are covered elsewhere in the review, so don't
+  discuss individual companies' results inside the summaries either.
+  This applies to the opinion piece too.
 - Don't just restate today's index performance.
 - Each news summary: what happened, context, why investors care, what
   could matter next.
@@ -1926,10 +1978,11 @@ RULES
   return those you have.
 """
     stories = []
-    for attempt, temp in ((1, 0.3), (2, 0.2)):
+    attempts = ((1, 0.3), (2, 0.2), (3, 0.4))
+    for attempt, temp in attempts:
         parsed = _groq_call(prompt, max_tokens=4500, temperature=temp,
                             label="stories" if attempt == 1
-                            else "stories retry")
+                            else f"stories retry {attempt - 1}")
         result = _parse_stories(parsed, market_news) if parsed else []
         if (_stories_complete(result, market_news)
                 or len(result) > len(stories)):
@@ -1937,7 +1990,7 @@ RULES
         if _stories_complete(stories, market_news):
             break
         print(f"Stories incomplete ({len(stories)} returned); "
-              + ("retrying once." if attempt == 1 else "keeping best."))
+              + ("retrying." if attempt < len(attempts) else "keeping best."))
     return stories
 
 
