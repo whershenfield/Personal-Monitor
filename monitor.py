@@ -489,25 +489,32 @@ def get_headlines(ticker, limit=5):
     return dedupe_headlines(out)[:limit]
 
 
-def tavily_search(query, days=1, max_results=10, depth="advanced"):
+def tavily_search(query, days=1, max_results=10, depth="advanced",
+                  include_domains=None, exclude_domains=None):
     """Run a Tavily news search and return normalized results."""
     api_key = getattr(config, "TAVILY_API_KEY", "")
     if not api_key:
         return []
 
+    body = {
+        "api_key": api_key,
+        "query": query,
+        "topic": "news",
+        "search_depth": depth,
+        "days": days,
+        "max_results": max_results,
+        "include_answer": False,
+    }
+    if include_domains:
+        body["include_domains"] = list(include_domains)
+    if exclude_domains:
+        body["exclude_domains"] = list(exclude_domains)
+
     try:
         response = requests.post(
             "https://api.tavily.com/search",
             headers={"Content-Type": "application/json"},
-            json={
-                "api_key": api_key,
-                "query": query,
-                "topic": "news",
-                "search_depth": depth,
-                "days": days,
-                "max_results": max_results,
-                "include_answer": False,
-            },
+            json=body,
             timeout=30,
         )
     except Exception as e:
@@ -728,53 +735,151 @@ def looks_like_opinion(headline):
                 or _OPINION_TITLE.search(headline.get("title", "")))
 
 
+# ---------------------------------------------------------------------------
+# News focus: who the review is for and which sources to trust.
+# Everything here can be overridden in config.py.
+# ---------------------------------------------------------------------------
+
+DEFAULT_READER_PROFILE = (
+    "a Canadian business student building a career in wealth and asset "
+    "management. They hold Canadian, U.S. and international (developed "
+    "markets) equity ETFs and follow EssilorLuxottica and S&P Global. "
+    "They care most about the U.S., Canada and Europe: the Fed, the Bank "
+    "of Canada and the ECB, Treasury and Canadian yields, the Canadian "
+    "dollar, oil, trade and tariffs, big-tech and AI investment, banks "
+    "and private credit, and the asset-management industry itself (fund "
+    "flows, fees, ETFs, private markets, deals among asset managers). "
+    "They like stories with a clear 'so what' for investors and "
+    "thoughtful, contrarian analysis."
+)
+
+# Outlets searched first for Top Market Stories and the opinion piece.
+DEFAULT_NEWS_DOMAINS = [
+    "reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com",
+    "marketwatch.com", "barrons.com", "economist.com", "apnews.com",
+    "nytimes.com", "axios.com", "fortune.com", "businessinsider.com",
+    "morningstar.com", "theglobeandmail.com", "financialpost.com",
+    "bnnbloomberg.ca", "cbc.ca", "investmentexecutive.com",
+    "advisor.ca", "institutionalinvestor.com", "pionline.com",
+]
+
+# Outlets never used (mostly regional business sites that flood the
+# results with local-market stories).
+DEFAULT_NEWS_EXCLUDE_DOMAINS = [
+    "economictimes.indiatimes.com", "timesofindia.indiatimes.com",
+    "livemint.com", "business-standard.com", "moneycontrol.com",
+    "thehindubusinessline.com", "financialexpress.com", "ndtvprofit.com",
+    "businesstoday.in", "zeebiz.com", "thehindu.com", "hindustantimes.com",
+    "indianexpress.com", "jakartaglobe.id", "thejakartapost.com",
+    "antaranews.com", "tempo.co", "kontan.co.id", "cnbcindonesia.com",
+    "bisnis.com", "theedgemalaysia.com", "thestar.com.my",
+    "bworldonline.com", "inquirer.net", "bangkokpost.com",
+    "vietnamnews.vn", "dawn.com", "tribune.com.pk",
+]
+
+READER_PROFILE = getattr(config, "READER_PROFILE", DEFAULT_READER_PROFILE)
+NEWS_DOMAINS = getattr(config, "NEWS_DOMAINS", DEFAULT_NEWS_DOMAINS)
+NEWS_EXCLUDE_DOMAINS = getattr(config, "NEWS_EXCLUDE_DOMAINS",
+                               DEFAULT_NEWS_EXCLUDE_DOMAINS)
+
+def _domain(url):
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _from_domain(url, domains):
+    host = _domain(url)
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_off_interest(headline):
+    """True for stories from excluded outlets."""
+    return _from_domain(headline.get("url"), NEWS_EXCLUDE_DOMAINS)
+
+
+def _focused_search(queries, days, per_query=10, min_results=12):
+    """
+    Search the preferred outlets first. If that comes back thin, widen to
+    the whole web (minus excluded outlets) so the section isn't empty.
+    """
+    results = []
+    for query in queries:
+        results.extend(tavily_search(
+            query, days=days, max_results=per_query,
+            include_domains=NEWS_DOMAINS or None,
+            exclude_domains=NEWS_EXCLUDE_DOMAINS or None,
+        ))
+    if len(dedupe_headlines(results)) < min_results:
+        print("Preferred outlets returned few results; widening search.")
+        for query in queries:
+            results.extend(tavily_search(
+                query, days=days, max_results=per_query,
+                exclude_domains=NEWS_EXCLUDE_DOMAINS or None,
+            ))
+    return results
+
+
+def _preferred_first(items):
+    """Newest first, but stories from preferred outlets ahead of others."""
+    items = sort_by_recency(items)
+    return ([h for h in items if _from_domain(h.get("url"), NEWS_DOMAINS)]
+            + [h for h in items
+               if not _from_domain(h.get("url"), NEWS_DOMAINS)])
+
+
 def gather_market_news(limit=20, opinion_limit=8):
     """
-    Today's major financial-market stories, minus earnings coverage,
-    plus a separate pool of opinion and commentary pieces.
+    Today's major financial-market stories, minus earnings coverage and
+    excluded outlets, plus a separate pool of opinion pieces.
     """
     print("Gathering market news from the web...")
     today = market_today().strftime("%B %d, %Y")
 
-    queries = [
-        f"major financial market news stocks bonds economy {today}",
-        f"Wall Street Federal Reserve interest rates inflation {today}",
-        f"major business financial news investors {today}",
-        f"oil gold dollar Treasury markets {today}",
-        f"economy policy trade geopolitics markets news {today}",
-        f"central banks currencies credit markets global economy {today}",
+    queries = getattr(config, "NEWS_QUERIES", None) or [
+        f"Wall Street stocks bonds Federal Reserve markets {today}",
+        f"Treasury yields inflation economy investors {today}",
+        f"Bank of Canada TSX Canadian dollar economy {today}",
+        f"Canada U.S. trade tariffs markets {today}",
+        f"ECB Europe markets economy {today}",
+        f"oil gold dollar commodities markets {today}",
+        f"asset management ETF fund flows private credit wealth {today}",
+        f"AI tech investment big tech markets {today}",
+        f"banks mergers deals Wall Street {today}",
     ]
-    results = []
-    for query in queries:
-        results.extend(tavily_search(query, days=1, max_results=10))
+    results = _focused_search(queries, days=1)
 
-    # Keep only stories from roughly the last day, and drop earnings.
+    # Keep only stories from roughly the last day; drop earnings and
+    # stories from excluded outlets.
     results = [h for h in results if is_recent(h, 30)]
     dropped = [h for h in results if is_earnings_story(h)]
     results = [h for h in results if not is_earnings_story(h)]
+    off_topic = [h for h in results if is_off_interest(h)]
+    results = [h for h in results if not is_off_interest(h)]
     # Opinion pieces that turn up in the news search join the opinion pool.
     found_opinion = [h for h in results if looks_like_opinion(h)]
     results = [h for h in results if not looks_like_opinion(h)]
-    results = sort_by_recency(dedupe_headlines(results))[:limit]
+    results = _preferred_first(dedupe_headlines(results))[:limit]
     for h in results:
         h["kind"] = "news"
 
-    opinion_queries = [
+    opinion_queries = getattr(config, "OPINION_QUERIES", None) or [
         f"opinion column markets economy investors {today}",
-        f"commentary analysis Wall Street Fed economy columnist {today}",
-        f"Bloomberg Opinion Breakingviews FT columnist markets economy {today}",
+        f"columnist Fed interest rates stocks bubble {today}",
+        f"Breakingviews FT Alphaville Bloomberg Opinion markets {today}",
+        f"Globe and Mail Financial Post opinion economy markets {today}",
     ]
-    opinions = list(found_opinion)
-    for query in opinion_queries:
-        opinions.extend(tavily_search(query, days=2, max_results=10))
+    opinions = list(found_opinion) + _focused_search(
+        opinion_queries, days=2, min_results=6
+    )
     opinions = [h for h in opinions
-                if is_recent(h, 54) and not is_earnings_story(h)]
+                if is_recent(h, 54) and not is_earnings_story(h)
+                and not is_off_interest(h)]
     # Prefer pieces that are clearly labelled opinion; otherwise let the
     # AI judge from the commentary search results.
     labelled = [h for h in opinions if looks_like_opinion(h)]
     opinions = labelled or opinions
     titles = {h["title"].strip().lower() for h in results}
-    opinions = [h for h in sort_by_recency(dedupe_headlines(opinions))
+    opinions = [h for h in _preferred_first(dedupe_headlines(opinions))
                 if h["title"].strip().lower() not in titles][:opinion_limit]
     for h in opinions:
         h["kind"] = "opinion"
@@ -782,7 +887,8 @@ def gather_market_news(limit=20, opinion_limit=8):
     print(
         f"Market news: {len(results)} stories, {len(opinions)} opinion "
         f"candidates ({len(labelled)} clearly labelled), "
-        f"{len(dropped)} earnings headlines excluded"
+        f"{len(dropped)} earnings and {len(off_topic)} excluded-outlet "
+        f"headlines removed"
     )
     combined = results + opinions
     for i, r in enumerate(combined, start=1):
@@ -1909,7 +2015,7 @@ def _parse_stories(parsed, market_news):
 
 
 def _stories_complete(stories, market_news):
-    """Five stories with one opinion piece, when the sources allow it."""
+    """Four news stories plus one opinion piece, when the sources allow it."""
     have_opinion = any(h.get("kind") == "opinion" for h in market_news)
     news_available = sum(1 for h in market_news if h.get("kind") != "opinion")
     want_news = min(4, news_available)
@@ -1939,6 +2045,8 @@ def build_market_story_summaries(market_news):
 You are writing the "Top Market Stories" section of a professional daily
 market review dated {_report_date()}, sent after the U.S. close.
 
+THE READER: {READER_PROFILE}
+
 NEWS HEADLINES:
 {block("news")}
 
@@ -1951,10 +2059,20 @@ Return JSON exactly in this shape:
 
 RULES
 - Return exactly 5 entries: 4 news stories followed by 1 opinion piece.
-- News stories: the 4 most important DISTINCT stories from NEWS
-  HEADLINES, like tonight's front page of Bloomberg, the FT or Reuters:
-  central banks, economic data, policy, geopolitics and trade, big moves
-  in rates/currencies/commodities/credit, major industry or corporate news.
+- News stories: the 4 DISTINCT stories from NEWS HEADLINES that matter
+  most to THE READER, like tonight's front page of Bloomberg, the FT or
+  the Globe and Mail's Report on Business: central banks, economic data,
+  policy, trade, big moves in rates/currencies/commodities/credit, and
+  major industry, deal or asset-management news.
+- Favour stories about the U.S., Canada and Europe, and at least one
+  story with a Canadian angle when a substantive one is available. Skip
+  stories about local markets or economies elsewhere (e.g. India,
+  Indonesia, Southeast Asia) unless they are clearly moving global
+  markets. China and Japan count only when the story is about their
+  effect on global markets, trade or rates.
+- Prefer stories that are genuinely interesting: a surprising shift, a
+  real debate, or a development with clear consequences for investors,
+  over routine recaps.
 - NO earnings stories. Skip anything about a company's quarterly results,
   EPS, revenue versus estimates, guidance, or an upcoming report, even if
   it seems important. Also skip market wraps or roundups driven mainly by
@@ -1966,7 +2084,8 @@ RULES
   could matter next.
 - Opinion piece: choose the single most thoughtful markets or economics
   opinion, column or commentary piece from OPINION AND COMMENTARY
-  CANDIDATES. It must be an argument from a columnist or commentator,
+  CANDIDATES, favouring the one THE READER would find most
+  interesting. It must be an argument from a columnist or commentator,
   not a straight news report, and not about earnings. Its summary states
   the author's argument and evidence, attributes it to them ("the
   columnist argues..."), and closes with the strongest counterpoint or
@@ -2055,9 +2174,12 @@ def build_overview(indices, sectors, factors, tickers, portfolio, macro,
 
     prompt = f"""
 You are writing the summary sections of a professional daily market
-review dated {_report_date()}, sent after the U.S. close, for someone
-building a career in wealth and asset management. All data is today's
-close unless tagged "[last data ...]".
+review dated {_report_date()}, sent after the U.S. close. All data is
+today's close unless tagged "[last data ...]".
+
+THE READER: {READER_PROFILE}
+Frame takeaways around what matters to them, including what today means
+for a Canadian investor holding U.S., Canadian and international ETFs.
 
 INDICES:
 {_fmt_rows(indices)}
