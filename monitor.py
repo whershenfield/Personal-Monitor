@@ -1202,19 +1202,15 @@ def fetch_earnings_calendar(day):
 
 def gather_recent_earnings():
     """
-    Biggest companies that reported since the last session:
-    yesterday after the close, plus everyone reporting today.
+    Biggest companies reporting today (before the open, after the close,
+    or time not supplied). Companies that reported after the previous
+    session's close are left out: they were already covered, with their
+    after-hours move, in the previous day's email.
     """
     today = market_today()
-    prev = previous_business_day(today)
 
     candidates = []
     calendar_ok = False
-
-    prev_rows = fetch_earnings_calendar(prev)
-    if prev_rows is not None:
-        calendar_ok = True
-        candidates += [r for r in prev_rows if r["timing"] == "After close"]
 
     today_rows = fetch_earnings_calendar(today)
     if today_rows is not None:
@@ -1788,7 +1784,10 @@ Return JSON exactly in this shape:
 RULES
 - One entry per listed company that has results coverage. If GENERAL
   EARNINGS NEWS is supplied, you may add up to 3 other major companies
-  that clearly reported in the last day; their cites refer to that list.
+  that clearly reported today ({_report_date()}), either before today's
+  open or after today's close; their cites refer to that list. Do not add
+  companies that reported on an earlier day, including after the previous
+  day's close, since those were covered in the previous report.
 - Each blurb: EPS and revenue versus expectations, guidance, the key
   business driver(s), and the stock reaction given above.
 - For companies that reported after today's close, the after-hours move
@@ -2518,17 +2517,23 @@ def _pct_span(value, bold=False):
 
 def build_after_hours_box(c):
     """
-    Shaded box for one company: the after-hours move as the headline,
-    a small price table, and a plain-English note on how to read it.
+    Shaded box for one company: the move that reflects the earnings
+    reaction as the headline (after-hours for companies that reported
+    after today's close, regular session otherwise), a small price table,
+    and a plain-English note on how to read it.
     """
     ah = c.get("after_hours")
     session = c.get("session")
     after_close = c.get("reported_after_today_close", False)
 
-    headline = (_pct_span(ah) if ah is not None
+    if after_close:
+        label, headline_value = "After-Hours Movement", ah
+    else:
+        label, headline_value = "Regular Session Movement", session
+    headline = (_pct_span(headline_value) if headline_value is not None
                 else '<span class="neutral">n/a</span>')
     html = '<div class="ah-box">'
-    html += f'<p class="ah-title">After-Hours Movement: {headline}</p>'
+    html += f'<p class="ah-title">{label}: {headline}</p>'
 
     if ah is not None:
         html += (
@@ -2538,9 +2543,9 @@ def build_after_hours_box(c):
             "</tr></thead><tbody><tr>"
             f'<td>{c["close"]:.2f}</td>'
             f'<td>{c["after_hours_price"]:.2f}</td>'
-            f"<td>{_pct_span(ah, bold=True)}</td>"
+            f"<td>{_pct_span(ah, bold=after_close)}</td>"
             f'<td>{html_escape(fmt_clock(c.get("after_hours_time")))}</td>'
-            f"<td>{_pct_span(session)}</td>"
+            f"<td>{_pct_span(session, bold=not after_close)}</td>"
             "</tr></tbody></table>"
         )
 
