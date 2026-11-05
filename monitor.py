@@ -1494,7 +1494,8 @@ def _groq_call(prompt, max_tokens=4000, temperature=0.3, label="ai"):
     )
 
     response = None
-    for attempt in range(1, 5):
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
         try:
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -1525,7 +1526,15 @@ def _groq_call(prompt, max_tokens=4000, temperature=0.3, label="ai"):
             payload.pop("response_format", None)
             continue
         if status in (413, 429) or status >= 500:
+            if attempt == max_attempts:
+                break
             wait = _retry_after_seconds(response)
+            if status == 429 and attempt >= 2:
+                # The per-minute token allowance is small, and the wait
+                # Groq suggests is often too short to fit a large request.
+                # After the first miss, wait out a full minute so the
+                # allowance has completely refilled.
+                wait = max(wait, 62.0)
             print(f"Groq rate-limited or busy; waiting {wait:.0f}s.")
             time.sleep(wait)
             continue
@@ -2595,10 +2604,20 @@ def build_after_hours_box(c, summary=""):
 def build_earnings_recap(recent, earnings_notes):
     if not earnings_notes:
         if recent.get("companies"):
-            return (
-                "<p>Major companies reported, but no detailed results "
-                "coverage was available in the sources reviewed.</p>"
+            # The written recap is missing (usually because the AI service
+            # was busy), but the calendar and price data are still worth
+            # showing, so list each company without a write-up.
+            earnings_notes = [
+                {"ticker": c["ticker"], "company": c["name"], "blurb": "",
+                 "cites": []}
+                for c in recent["companies"]
+            ]
+            intro = (
+                "<p><em>The written earnings recap was unavailable for "
+                "this report, so the reported figures and price moves are "
+                "shown without commentary.</em></p>"
             )
+            return intro + build_earnings_recap(recent, earnings_notes)
         return "<p>No major earnings reports since the last session.</p>"
 
     by_ticker = {c["ticker"]: c for c in recent.get("companies", [])}
