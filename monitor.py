@@ -100,6 +100,15 @@ def market_today():
     return datetime.now(MARKET_TZ).date()
 
 
+def market_is_open():
+    """True during the regular U.S. session (9:30 AM-4:00 PM ET, weekdays)."""
+    now = datetime.now(MARKET_TZ)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
 def next_day(d):
     return d + timedelta(days=1)
 
@@ -290,6 +299,7 @@ def _fetch_quote(ticker):
 
     return {
         "price": current,
+        "prev_close": prev_close,
         "daily": (current - prev_close) / prev_close * 100,
         "ytd": (current - ytd_base) / ytd_base * 100,
         "as_of": as_of,
@@ -1233,6 +1243,7 @@ def gather_recent_earnings():
         # 4 PM close.
         c["session"] = quote["daily"] if fresh else None
         c["close"] = quote["price"] if fresh else None
+        c["prev_close"] = quote.get("prev_close") if fresh else None
         ah = _after_hours_quote(c["ticker"], c["close"])
         c["after_hours"] = ah["change"] if ah else None
         c["after_hours_price"] = ah["price"] if ah else None
@@ -2542,6 +2553,7 @@ def build_after_hours_box(c, summary=""):
     ah = c.get("after_hours")
     session = c.get("session")
     after_close = c.get("reported_after_today_close", False)
+    open_now = market_is_open()
 
     if after_close:
         label, headline_value = "After-Hours Movement", ah
@@ -2565,10 +2577,33 @@ def build_after_hours_box(c, summary=""):
             f"<td>{_pct_span(session, bold=not after_close)}</td>"
             "</tr></tbody></table>"
         )
+    elif session is not None and c.get("close") is not None:
+        # No after-hours trading (yet), e.g. during market hours: show the
+        # regular-session prices so every company gets the same layout.
+        price_label = "Last Price" if open_now else "Today's Close"
+        prev = c.get("prev_close")
+        html += (
+            '<table class="ah-table"><thead><tr>'
+            f"<th>Previous Close</th><th>{price_label}</th>"
+            "<th>Regular Session Change</th>"
+            "</tr></thead><tbody><tr>"
+            f'<td>{f"{prev:.2f}" if prev else "—"}</td>'
+            f'<td>{c["close"]:.2f}</td>'
+            f"<td>{_pct_span(session, bold=not after_close)}</td>"
+            "</tr></tbody></table>"
+        )
 
     thin = ("After-hours trading is thin, so the price can shift by "
             "tomorrow's open.")
-    if after_close and ah is not None:
+    if open_now and after_close:
+        note = ("Results are due after today's close, so the market's "
+                "reaction will show in after-hours trading. The move shown "
+                "is from today's session so far, before the report.")
+    elif open_now:
+        note = ("Results came out before today's open, so the "
+                "regular-session move is the reaction. The market was still "
+                "open when this report ran, so the move isn't final.")
+    elif after_close and ah is not None:
         note = ("Results came out after today's close, so this is the "
                 "market's first reaction to them. The regular-session move "
                 f"happened before the report. {thin}")
