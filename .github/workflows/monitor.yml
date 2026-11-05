@@ -3,6 +3,12 @@ name: Stock Monitor
 on:
   workflow_dispatch:  # Lets you trigger it manually from GitHub for testing
 
+# Never run two copies at once: they would share the AI service's
+# per-minute allowance and both could send an email.
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false
+
 jobs:
   check-stocks:
     runs-on: ubuntu-latest
