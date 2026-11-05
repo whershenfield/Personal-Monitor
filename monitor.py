@@ -2564,32 +2564,35 @@ def build_after_hours_box(c, summary=""):
     html = '<div class="ah-box">'
     html += f'<p class="ah-title">{label}: {headline}</p>'
 
-    if ah is not None:
-        html += (
-            '<table class="ah-table"><thead><tr>'
-            "<th>Today's Close</th><th>After-Hours Price</th><th>Change</th>"
-            "<th>Last Trade</th><th>Regular Session Today</th>"
-            "</tr></thead><tbody><tr>"
-            f'<td>{c["close"]:.2f}</td>'
-            f'<td>{c["after_hours_price"]:.2f}</td>'
-            f"<td>{_pct_span(ah, bold=after_close)}</td>"
-            f'<td>{html_escape(fmt_clock(c.get("after_hours_time")))}</td>'
-            f"<td>{_pct_span(session, bold=not after_close)}</td>"
-            "</tr></tbody></table>"
-        )
-    elif session is not None and c.get("close") is not None:
-        # No after-hours trading (yet), e.g. during market hours: show the
-        # regular-session prices so every company gets the same layout.
-        price_label = "Last Price" if open_now else "Today's Close"
+    # The table shows the other trading window, so it adds information
+    # instead of repeating the headline: regular-session prices under an
+    # after-hours headline, after-hours prices under a regular-session one.
+    close = c.get("close")
+    if after_close:
         prev = c.get("prev_close")
+        price_label = "Last Price" if open_now else "Today's Close"
         html += (
             '<table class="ah-table"><thead><tr>'
             f"<th>Previous Close</th><th>{price_label}</th>"
             "<th>Regular Session Change</th>"
             "</tr></thead><tbody><tr>"
             f'<td>{f"{prev:.2f}" if prev else "—"}</td>'
-            f'<td>{c["close"]:.2f}</td>'
-            f"<td>{_pct_span(session, bold=not after_close)}</td>"
+            f'<td>{f"{close:.2f}" if close is not None else "—"}</td>'
+            f"<td>{_pct_span(session)}</td>"
+            "</tr></tbody></table>"
+        )
+    else:
+        ah_price = c.get("after_hours_price") if ah is not None else None
+        close_label = "Last Price" if open_now else "Today's Close"
+        html += (
+            '<table class="ah-table"><thead><tr>'
+            f"<th>{close_label}</th><th>After-Hours Price</th>"
+            "<th>After-Hours Change</th><th>Last Trade</th>"
+            "</tr></thead><tbody><tr>"
+            f'<td>{f"{close:.2f}" if close is not None else "—"}</td>'
+            f'<td>{f"{ah_price:.2f}" if ah_price is not None else "—"}</td>'
+            f"<td>{_pct_span(ah)}</td>"
+            f'<td>{html_escape(fmt_clock(c.get("after_hours_time"))) if ah is not None else "—"}</td>'
             "</tr></tbody></table>"
         )
 
