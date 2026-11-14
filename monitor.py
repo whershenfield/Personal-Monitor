@@ -1411,6 +1411,9 @@ def gather_upcoming_earnings():
             f'"{r["name"]}" earnings preview what to expect analysts',
             days=7,
             max_results=6,
+            # Basic search costs 1 Tavily credit instead of 2; previews
+            # only need a few headlines about one named company.
+            depth="basic",
         )
         relevant = [
             h for h in news
