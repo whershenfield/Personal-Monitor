@@ -3,6 +3,8 @@ GIST_ID = ""
 GIST_TOKEN = ""
 TAVILY_API_KEY = ""
 
+RATES_CHART_DAYS = 180 # This can only go back as far as Jan 1 of the previous year
+
 INDICES = ["^GSPC", "^IXIC", "^RUT", "^DJI", "EFA", "^GSPTSE"]
 TICKERS = ["EL.PA", "SPGI"]
 
