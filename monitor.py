@@ -757,7 +757,7 @@ def looks_like_opinion(headline):
 DEFAULT_READER_PROFILE = (
     "a Canadian finance student with broad interests "
     "across markets, the economy and business. They hold Canadian, U.S. "
-    "and international (developed markets) equity ETFs, as well as 
+    "and international (developed markets) equity ETFs, as well as "
     "tracking various companies globally. They care most about the U.S., "
     "Canada and Europe: the Fed, the Bank of Canada and the ECB, "
     "Treasury and Canadian yields, the Canadian dollar, oil, trade and "
