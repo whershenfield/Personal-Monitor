@@ -6,8 +6,8 @@ An automated end-of-day market report, delivered by email after the U.S./CAN clo
 
 1. **Executive Summary**: the day's key takeaways across equities, rates, sectors, factors and earnings.
 2. **Market Dashboard**: major indices, weighted returns for model portfolios, sector and factor/style performance, tracked stocks, and a company-by-company review that explains each move relative to its market and sector.
-3. **Rates, Macro & Cross-Asset**: 2Y, 10Y and 30Y Treasury yields, the 2s10s spread, the dollar, gold, Brent crude and the VIX.
-4. **Top Market Stories**: four of the day's most important non-earnings stories plus one opinion piece, each with a source link.
+3. **Rates, Macro & Cross-Asset**: 2Y, 10Y and 30Y Treasury yields, the 2s10s spread, the dollar, gold, Brent crude and the VIX, plus a chart of the three yields and the 2s10s spread over the last 90 days (adjustable).
+4. **Top Market Stories**: four of the day's most important non-earnings stories plus one opinion piece, each with a source link. The mix is kept broad (central banks, data, policy, trade, rates, currencies, commodities, credit, and major company and deal news), with at least one Canadian story when a substantive one is available.
 5. **Earnings Recap**: the largest companies that just reported, with results versus expectations and the stock's reaction, including after-hours moves for after-close reporters.
 6. **Investment Implications**: bull case, bear case and a key question to monitor.
 7. **Looking Ahead**: previews of major earnings in the next two business days, macro developments to watch, and a forward view on the broader market outlook.
@@ -19,7 +19,8 @@ The script runs on GitHub Actions. Each run, it:
 
 - Checks that today's market data is available, so nothing goes out on holidays or before the close.
 - Checks a small GitHub Gist to see whether the report has already been sent today. This means it's safe to trigger more than once a day.
-- Gathers data, writes the analysis in several separate AI requests, builds the email and sends it.
+- Waits for any run already in progress to finish rather than running alongside it, so two runs never compete for the AI service's per-minute limit or both send an email.
+- Gathers data, writes the analysis in several separate AI requests, draws the yields chart, builds the email and sends it.
 - Records the run in the Gist.
 
 **Data sources**
@@ -27,7 +28,7 @@ The script runs on GitHub Actions. Each run, it:
 | Source | Used for |
 | --- | --- |
 | Yahoo Finance (via `yfinance`) | Prices and company headlines |
-| U.S. Treasury | Daily yield curve |
+| U.S. Treasury | Daily yield curve and yields chart history |
 | FRED | Fallback for Treasury yields |
 | Nasdaq earnings calendar | Recent and upcoming earnings |
 | Tavily | News search |
@@ -85,11 +86,14 @@ Edit `config.py` to change what the report covers:
 - `TICKERS`: individual stocks that get a company-by-company review.
 - `PORTFOLIO`, `INDEX_PORTFOLIO` and `AVANTIS_PORTFOLIO`: the holdings in each model portfolio.
 - `PORTFOLIO_WEIGHTS`, `INDEX_PORTFOLIO_WEIGHTS` and `AVANTIS_PORTFOLIO_WEIGHTS`: the weight of each holding in its portfolio.
+- `RATES_CHART_DAYS`: how many calendar days the Treasury yields chart covers (default 90). It can reach back no further than January 1 of the previous year.
 
 You can also add these optional settings to `config.py`:
 
 | Setting | Use |
 | --- | --- |
+| `READER_PROFILE` | A short description of the reader, which steers which stories are chosen and how they're framed |
+| `NEWS_DOMAINS` / `NEWS_EXCLUDE_DOMAINS` | News outlets to search first, and outlets never to use |
 | `SECTOR_ETFS` / `FACTOR_ETFS` | Replace the default sector and factor ETF proxies |
 | `TICKER_NAMES` | Set display names, e.g. `{"EL.PA": "EssilorLuxottica"}` |
 | `TICKER_KEYWORDS` | Words a headline must contain to count as news about a company |
@@ -101,7 +105,7 @@ You can also add these optional settings to `config.py`:
 ## Running locally
 
 ```bash
-pip install requests pytz yfinance
+pip install requests pytz yfinance matplotlib
 export GROQ_API_KEY=...        # and the other variables listed above
 python monitor.py
 ```
@@ -111,6 +115,7 @@ python monitor.py
 - **Unofficial data sources.** Yahoo Finance and the Nasdaq earnings calendar are not official public APIs. They can change or break without notice, and individual data points are sometimes late or missing. Late prices are marked with a † in the report.
 - **AI-generated commentary.** The model is instructed to use only the supplied data and sources, but it can still misstate facts or draw weak conclusions. Check anything important against the original sources.
 - **After-hours moves are preliminary.** Volume after the close is thin, so these prices can change significantly by the next open.
+- **The yields chart is optional.** If there's too little Treasury data or the chart can't be drawn, the email goes out without it rather than failing.
 
 ## Disclaimer
 
