@@ -31,7 +31,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests pytz yfinance
+        run: pip install requests pytz yfinance matplotlib
 
       - name: Run monitor
         env:
