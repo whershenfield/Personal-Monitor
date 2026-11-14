@@ -15,6 +15,7 @@ import requests
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from html import escape
 from urllib.parse import urlparse
 
@@ -71,6 +72,9 @@ DEFAULT_FACTOR_ETFS = {
 
 SECTOR_ETFS = getattr(config, "SECTOR_ETFS", DEFAULT_SECTOR_ETFS)
 FACTOR_ETFS = getattr(config, "FACTOR_ETFS", DEFAULT_FACTOR_ETFS)
+
+# How many calendar days of history the Treasury yields chart covers.
+RATES_CHART_DAYS = getattr(config, "RATES_CHART_DAYS", 90)
 
 # Optional custom security names and news keywords.
 TICKER_NAMES = getattr(config, "TICKER_NAMES", {})
@@ -949,7 +953,9 @@ def get_treasury_curve():
     the same afternoon. (FRED's copy lags a day, which is why the old
     report showed yesterday's yields.)
     """
-    year = market_today().year
+    today = market_today()
+    earliest_needed = today - timedelta(days=RATES_CHART_DAYS)
+    year = today.year
     rows = []
     for y in (year, year - 1):
         url = (
@@ -972,7 +978,8 @@ def get_treasury_curve():
             except ValueError:
                 continue
             rows.append((d, row))
-        if len(rows) >= 2:
+        # Stop once we have the latest two days and enough chart history.
+        if len(rows) >= 2 and min(d for d, _ in rows) <= earliest_needed:
             break
     rows.sort(key=lambda x: x[0])
     return rows
@@ -1008,13 +1015,14 @@ def _to_float(value):
         return None
 
 
-def gather_rates():
+def gather_rates(curve=None):
     tenors = [("2Y Treasury", "2 Yr", "DGS2"),
               ("10Y Treasury", "10 Yr", "DGS10"),
               ("30Y Treasury", "30 Yr", "DGS30")]
     rates = []
 
-    curve = get_treasury_curve()
+    if curve is None:
+        curve = get_treasury_curve()
     if len(curve) >= 2:
         (prev_date, prev_row), (last_date, last_row) = curve[-2], curve[-1]
         for label, column, _ in tenors:
@@ -1056,8 +1064,113 @@ def gather_rates():
     return rates
 
 
+def rate_history(curve):
+    """Daily 2Y / 10Y / 30Y yields and 2s10s over the chart window."""
+    cutoff = market_today() - timedelta(days=RATES_CHART_DAYS)
+    history = []
+    for d, row in curve:
+        if d < cutoff:
+            continue
+        two = _to_float(row.get("2 Yr"))
+        ten = _to_float(row.get("10 Yr"))
+        thirty = _to_float(row.get("30 Yr"))
+        if two is None or ten is None or thirty is None:
+            continue
+        history.append({"date": d, "2Y": two, "10Y": ten, "30Y": thirty,
+                        "2s10s": (ten - two) * 100})
+    return history
+
+
+def build_rates_chart(history):
+    """
+    Two-panel PNG: yields on top, 2s10s spread (bps) underneath.
+    Returns the image bytes, or None if there's too little data or the
+    chart can't be drawn, in which case the email simply goes without it.
+    """
+    if len(history) < 5:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except Exception as e:
+        print(f"Rates chart skipped (matplotlib unavailable): {e}")
+        return None
+
+    try:
+        plt.rcParams.update({
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "Liberation Serif",
+                           "DejaVu Serif"],
+            "font.size": 10,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.edgecolor": "#444",
+            "axes.grid": True,
+            "grid.color": "#e3e3e3",
+            "grid.linewidth": 0.6,
+        })
+        dates = [h["date"] for h in history]
+        fig, (top, bottom) = plt.subplots(
+            2, 1, figsize=(7.2, 5.2), sharex=True,
+            gridspec_kw={"height_ratios": [2.2, 1], "hspace": 0.12},
+        )
+
+        series = [("2Y", "#1b6ca8"), ("10Y", "#d95f02"), ("30Y", "#2e8b57")]
+        for key, color in series:
+            values = [h[key] for h in history]
+            top.plot(dates, values, color=color, linewidth=1.8)
+            top.annotate(
+                f"{key} {values[-1]:.2f}%", xy=(dates[-1], values[-1]),
+                xytext=(6, 0), textcoords="offset points",
+                va="center", color=color, fontweight="bold",
+            )
+        top.set_ylabel("Yield (%)")
+        top.yaxis.set_major_formatter(
+            matplotlib.ticker.FormatStrFormatter("%.2f")
+        )
+        top.set_title(
+            f"U.S. Treasury yields, last {RATES_CHART_DAYS} days",
+            loc="left", fontsize=12, fontweight="bold",
+        )
+
+        spread = [h["2s10s"] for h in history]
+        bottom.plot(dates, spread, color="#333", linewidth=1.6)
+        bottom.fill_between(dates, spread, 0, where=[v >= 0 for v in spread],
+                            color="#008000", alpha=0.12, interpolate=True)
+        bottom.fill_between(dates, spread, 0, where=[v < 0 for v in spread],
+                            color="#b00000", alpha=0.12, interpolate=True)
+        bottom.axhline(0, color="#777", linewidth=0.8)
+        bottom.annotate(
+            f"2s10s {spread[-1]:+.0f} bps", xy=(dates[-1], spread[-1]),
+            xytext=(6, 0), textcoords="offset points",
+            va="center", color="#333", fontweight="bold",
+        )
+        bottom.set_ylabel("2s10s (bps)")
+        bottom.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        bottom.xaxis.set_major_locator(
+            mdates.AutoDateLocator(minticks=4, maxticks=8)
+        )
+        # leave room on the right for the end-of-line labels
+        top.set_xlim(dates[0], dates[-1] + (dates[-1] - dates[0]) * 0.16)
+
+        fig.text(0.01, 0.005, "Source: U.S. Treasury daily par yield curve",
+                 fontsize=8, color="#555")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                    facecolor="white")
+        plt.close(fig)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"Rates chart failed: {e}")
+        return None
+
+
 def gather_macro_data():
-    data = {"rates": gather_rates(), "cross_asset": []}
+    curve = get_treasury_curve()
+    data = {"rates": gather_rates(curve), "cross_asset": []}
+    data["rates_chart"] = build_rates_chart(rate_history(curve))
     cross_asset_map = {
         "DXY": "DX-Y.NYB",
         "Gold": "GC=F",
@@ -2433,6 +2546,13 @@ def build_macro_table(macro):
                 "</tr>"
             )
         html += "</tbody></table>"
+        if macro.get("rates_chart"):
+            html += (
+                '<p><img src="cid:rates_chart" width="680" '
+                'alt="Chart of 2Y, 10Y and 30Y Treasury yields and the '
+                '2s10s spread over recent months" '
+                'style="max-width:100%;height:auto;display:block;"></p>'
+            )
 
     if macro.get("cross_asset"):
         html += (
@@ -2900,8 +3020,11 @@ FRED &amp; Groq
 # Email sending
 # ---------------------------------------------------------------------------
 
-def send_email(subject, html_body, plain_text_body=None):
-    msg = MIMEMultipart("alternative")
+def send_email(subject, html_body, plain_text_body=None, images=None):
+    """images: optional {content_id: png_bytes}, shown via <img src="cid:...">."""
+    images = {k: v for k, v in (images or {}).items() if v}
+    body = MIMEMultipart("alternative")
+    msg = MIMEMultipart("related") if images else body
     msg["Subject"] = subject
     msg["From"] = config.EMAIL_SENDER
     msg["To"] = ", ".join(config.EMAIL_RECIPIENT)
@@ -2909,8 +3032,16 @@ def send_email(subject, html_body, plain_text_body=None):
     if not plain_text_body:
         plain_text_body = "Please view this email in an HTML-capable email client."
 
-    msg.attach(MIMEText(plain_text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    body.attach(MIMEText(plain_text_body, "plain", "utf-8"))
+    body.attach(MIMEText(html_body, "html", "utf-8"))
+    if images:
+        msg.attach(body)
+        for cid, data in images.items():
+            img = MIMEImage(data, "png")
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline",
+                           filename=f"{cid}.png")
+            msg.attach(img)
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(config.EMAIL_SENDER, config.EMAIL_PASSWORD)
@@ -3003,7 +3134,8 @@ def main():
         ai=ai,
     )
 
-    send_email(subject=subject, html_body=html_body)
+    send_email(subject=subject, html_body=html_body,
+               images={"rates_chart": macro.get("rates_chart")})
     print(f"{REPORT_TITLE} email sent.")
     mark_run_success()
 
