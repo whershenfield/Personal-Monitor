@@ -1,6 +1,6 @@
 # Daily Market Review
 
-An automated end-of-day market report, delivered by email after the U.S. close. It pulls prices, rates, news and earnings data, uses an AI model to write the commentary, and sends a formatted review of the day's markets.
+An automated end-of-day market report, delivered by email after the U.S./CAN close. It pulls prices, rates, news and earnings data, uses an AI model to write the commentary, and sends a formatted review of the day's markets.
 
 ## What's in the report
 
