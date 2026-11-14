@@ -755,16 +755,17 @@ def looks_like_opinion(headline):
 # ---------------------------------------------------------------------------
 
 DEFAULT_READER_PROFILE = (
-    "a Canadian business student building a career in wealth and asset "
-    "management. They hold Canadian, U.S. and international (developed "
-    "markets) equity ETFs and follow EssilorLuxottica and S&P Global. "
-    "They care most about the U.S., Canada and Europe: the Fed, the Bank "
-    "of Canada and the ECB, Treasury and Canadian yields, the Canadian "
-    "dollar, oil, trade and tariffs, big-tech and AI investment, banks "
-    "and private credit, and the asset-management industry itself (fund "
-    "flows, fees, ETFs, private markets, deals among asset managers). "
-    "They like stories with a clear 'so what' for investors and "
-    "thoughtful, contrarian analysis."
+    "a Canadian finance student with broad interests "
+    "across markets, the economy and business. They hold Canadian, U.S. "
+    "and international (developed markets) equity ETFs, as well as 
+    "tracking various companies globally. They care most about the U.S., "
+    "Canada and Europe: the Fed, the Bank of Canada and the ECB, "
+    "Treasury and Canadian yields, the Canadian dollar, oil, trade and "
+    "tariffs, big-tech and AI investment, banks, credit, deals and "
+    "corporate news. The asset-management "
+    "and ETF industry is one interest among these, not the main lens. "
+    "They like stories with a clear 'so what' and thoughtful, "
+    "contrarian analysis."
 )
 
 # Outlets searched first for Top Market Stories and the opinion piece.
@@ -773,8 +774,7 @@ DEFAULT_NEWS_DOMAINS = [
     "marketwatch.com", "barrons.com", "economist.com", "apnews.com",
     "nytimes.com", "axios.com", "fortune.com", "businessinsider.com",
     "morningstar.com", "theglobeandmail.com", "financialpost.com",
-    "bnnbloomberg.ca", "cbc.ca", "investmentexecutive.com",
-    "advisor.ca", "institutionalinvestor.com", "pionline.com",
+    "bnnbloomberg.ca", "cbc.ca",
 ]
 
 # Outlets never used (mostly regional business sites that flood the
@@ -2198,7 +2198,10 @@ RULES
   most to THE READER, like tonight's front page of Bloomberg, the FT or
   the Globe and Mail's Report on Business: central banks, economic data,
   policy, trade, big moves in rates/currencies/commodities/credit, and
-  major industry, deal or asset-management news.
+  major company, industry, deal or regulatory news.
+- Keep the mix broad. Asset management, wealth management and ETFs are
+  one interest among several: include such a story when it is among
+  the day's most important, but normally no more than one of the 4.
 - Favour stories about the U.S., Canada and Europe, and at least one
   story with a Canadian angle when a substantive one is available. Skip
   stories about local markets or economies elsewhere (e.g. India,
@@ -2215,8 +2218,10 @@ RULES
   discuss individual companies' results inside the summaries either.
   This applies to the opinion piece too.
 - Don't just restate today's index performance.
-- Each news summary: what happened, context, why investors care, what
-  could matter next.
+- Each news summary: what happened, context, why it matters, what
+  could matter next. Summarize each story on its own terms. Do not add
+  ETF, fund-flow, asset-management or portfolio angles unless the
+  article itself is about them.
 - Opinion piece: choose the single most thoughtful markets or economics
   opinion, column or commentary piece from OPINION AND COMMENTARY
   CANDIDATES, favouring the one THE READER would find most
