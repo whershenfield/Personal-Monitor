@@ -78,6 +78,11 @@ RATES_CHART_DAYS = getattr(config, "RATES_CHART_DAYS", 90)
 
 # Optional custom security names and news keywords.
 TICKER_NAMES = getattr(config, "TICKER_NAMES", {})
+
+# Name credited in the header line, e.g. "Prepared by Jane Doe". Leave blank
+# in config.py to hide the credit.
+REPORT_AUTHOR = getattr(config, "REPORT_AUTHOR", "")
+READING_WPM = 230  # average adult reading speed for prose
 TICKER_KEYWORDS = getattr(config, "TICKER_KEYWORDS", {})
 
 # Portfolio definitions and weights.
@@ -2924,7 +2929,7 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 <body><div class="container">
 
 <h1>{REPORT_TITLE}</h1>
-<p class="date">{html_escape(now)}</p>
+<p class="date">__HEADER_LINE__</p>
 
 <h1>1. Executive Summary</h1>
 {build_bullet_list(ai.get("executive_summary", []))}
@@ -3018,7 +3023,24 @@ FRED &amp; Groq
 
 </div></body></html>
 """
-    return html
+    return html.replace("__HEADER_LINE__", build_header_line(now, html), 1)
+
+
+def estimate_read_minutes(html):
+    """Estimated reading time for the report's prose. Tables, charts and
+    styling are left out because readers scan figures rather than read them
+    word by word, and counting every number would overstate the time."""
+    text = re.sub(r"(?is)<(style|table)\b.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    words = len(re.findall(r"\w+", text))
+    return max(1, -(-words // READING_WPM))  # round up
+
+
+def build_header_line(date_text, html):
+    parts = [html_escape(date_text), f"{estimate_read_minutes(html)} min read"]
+    if REPORT_AUTHOR:
+        parts.append(f"Prepared by {html_escape(REPORT_AUTHOR)}")
+    return " &nbsp;&middot;&nbsp; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
