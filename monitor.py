@@ -92,6 +92,10 @@ INDEX_PORTFOLIO_WEIGHTS = getattr(config, "INDEX_PORTFOLIO_WEIGHTS", {})
 AVANTIS_PORTFOLIO = getattr(config, "AVANTIS_PORTFOLIO", [])
 AVANTIS_PORTFOLIO_WEIGHTS = getattr(config, "AVANTIS_PORTFOLIO_WEIGHTS", {})
 
+# Tickers shown side by side under "Canadian Comparison". This is a plain
+# comparison, not a portfolio, so it has no weights. Leave empty to hide it.
+CANADIAN_COMPARISON = getattr(config, "CANADIAN_COMPARISON", [])
+
 # Earnings settings (overridable in config.py).
 RECENT_EARNINGS_LIMIT = getattr(config, "RECENT_EARNINGS_LIMIT", 6)
 RECENT_EARNINGS_MIN_CAP = getattr(config, "RECENT_EARNINGS_MIN_CAP", 10e9)
@@ -2918,8 +2922,8 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 
 
 def compose_email(indices, sectors, factors, tickers, portfolio,
-                  index_portfolio, avantis_portfolio, macro, market_news,
-                  lookahead, recent_earnings, earnings_notes, previews, ai):
+                  index_portfolio, avantis_portfolio, canadian_comparison,
+                  macro, market_news, lookahead, recent_earnings, earnings_notes, previews, ai):
 
     now = datetime.now(MARKET_TZ).strftime("%A, %B %d, %Y")
     impl = ai.get("investment_implications", {})
@@ -2964,6 +2968,10 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
                 "and holdings data.</p>"
             )
         html += build_quote_table(rows, include_price=True)
+
+    if canadian_comparison:
+        html += "<h3>Canadian Comparison</h3>"
+        html += build_quote_table(canadian_comparison, include_price=True)
 
     html += f"""
 <h2>Sector Performance</h2>
@@ -3100,6 +3108,7 @@ def main():
     portfolio = gather_group(config.PORTFOLIO)
     index_portfolio = gather_group(INDEX_PORTFOLIO)
     avantis_portfolio = gather_group(AVANTIS_PORTFOLIO)
+    canadian_comparison = gather_group(CANADIAN_COMPARISON)
 
     print("Gathering sectors and factors...")
     sectors = gather_sectors(SECTOR_ETFS)
@@ -3152,6 +3161,7 @@ def main():
         portfolio=portfolio,
         index_portfolio=index_portfolio,
         avantis_portfolio=avantis_portfolio,
+        canadian_comparison=canadian_comparison,
         macro=macro,
         market_news=market_news,
         lookahead=lookahead,
