@@ -85,6 +85,16 @@ REPORT_AUTHOR = getattr(config, "REPORT_AUTHOR", "")
 READING_WPM = 230  # average adult reading speed for prose
 TICKER_KEYWORDS = getattr(config, "TICKER_KEYWORDS", {})
 
+# Tracked-ticker news settings (overridable in config.py).
+# A day's move is flagged as unusual when it is at least this many times
+# the stock's typical daily move, and at least BIG_MOVE_MIN_PCT.
+BIG_MOVE_MULTIPLE = getattr(config, "BIG_MOVE_MULTIPLE", 2.5)
+BIG_MOVE_MIN_PCT = getattr(config, "BIG_MOVE_MIN_PCT", 2.5)
+# How many days the report remembers headlines it has already shown.
+SEEN_HEADLINE_DAYS = getattr(config, "SEEN_HEADLINE_DAYS", 14)
+# Extra news sources to skip, as website domains or publisher names.
+NEWS_BLOCKED_SOURCES = getattr(config, "NEWS_BLOCKED_SOURCES", [])
+
 # Portfolio definitions and weights. The old config names (INDEX_PORTFOLIO,
 # PASSIVE_PORTFOLIO) still work as a fallback.
 PORTFOLIO_WEIGHTS = getattr(config, "PORTFOLIO_WEIGHTS", {})
@@ -198,7 +208,20 @@ def _gist_headers():
     }
 
 
+_RUN_STATE = None
+
+
 def get_run_state():
+    """The saved run record, fetched once per run."""
+    global _RUN_STATE
+    if _RUN_STATE is None:
+        _RUN_STATE = _fetch_run_state()
+    return _RUN_STATE
+
+
+def _fetch_run_state():
+    if not config.GIST_ID or not config.GIST_TOKEN:
+        return {}
     try:
         r = requests.get(
             f"https://api.github.com/gists/{config.GIST_ID}",
@@ -217,25 +240,47 @@ def get_run_state():
         r.json().get("files", {}).get("run_state.json", {}).get("content", "{}")
     )
     try:
-        return json.loads(content)
+        state = json.loads(content)
     except json.JSONDecodeError:
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def already_ran_today():
     return get_run_state().get("last_run_date") == market_today().isoformat()
 
 
-def mark_run_success():
-    payload = {
-        "files": {
-            "run_state.json": {
-                "content": json.dumps(
-                    {"last_run_date": market_today().isoformat()}
-                )
-            }
-        }
+def last_run_date():
+    """Date of the last report that went out, or None."""
+    value = get_run_state().get("last_run_date")
+    try:
+        return date.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def mark_run_success(seen_items=None):
+    """
+    Records today's run, plus the tracked-ticker headlines and analyst
+    actions shown today, so tomorrow's report only shows what's new.
+    """
+    today = market_today()
+    cutoff = (today - timedelta(days=SEEN_HEADLINE_DAYS)).isoformat()
+    seen = {
+        ticker: [s for s in items if str(s.get("date", "")) >= cutoff]
+        for ticker, items in (get_run_state().get("seen") or {}).items()
+        if isinstance(items, list)
     }
+    for ticker, keys in (seen_items or {}).items():
+        existing = seen.setdefault(ticker, [])
+        known = {s.get("key") for s in existing}
+        existing += [
+            {"key": k, "date": today.isoformat()} for k in keys
+            if k not in known
+        ]
+    seen = {ticker: items for ticker, items in seen.items() if items}
+    state = {"last_run_date": today.isoformat(), "seen": seen}
+    payload = {"files": {"run_state.json": {"content": json.dumps(state)}}}
     try:
         r = requests.patch(
             f"https://api.github.com/gists/{config.GIST_ID}",
@@ -329,7 +374,32 @@ def _fetch_quote(ticker):
         "ytd": (current - ytd_base) / ytd_base * 100,
         "as_of": as_of,
         "stale": as_of < today,
+        "typical_move": _typical_move([c for _, c in series[:-1]]),
     }
+
+
+def _typical_move(closes, sessions=60):
+    """
+    Median size of the stock's daily moves (in %) over recent sessions,
+    excluding today, so one big day doesn't raise its own bar.
+    """
+    closes = closes[-(sessions + 1):]
+    moves = sorted(
+        abs(b - a) / a * 100 for a, b in zip(closes, closes[1:]) if a
+    )
+    if len(moves) < 10:
+        return None
+    mid = len(moves) // 2
+    return moves[mid] if len(moves) % 2 else (moves[mid - 1] + moves[mid]) / 2
+
+
+def is_big_move(row):
+    """True when today's move is unusually large for this stock."""
+    typical = row.get("typical_move")
+    move = abs(row.get("daily") or 0)
+    if move < BIG_MOVE_MIN_PCT:
+        return False
+    return typical is None or move >= BIG_MOVE_MULTIPLE * typical
 
 
 def get_quote(ticker):
@@ -579,39 +649,283 @@ def tavily_search(query, days=1, max_results=10, depth="advanced",
     return out
 
 
-def search_company_news(ticker, limit=5):
-    """Search the web for company-specific news from the last week."""
+# ---------------------------------------------------------------------------
+# Tracked tickers: what's new since the last report
+# ---------------------------------------------------------------------------
+
+# Sites that mostly publish auto-generated filings write-ups ("XYZ Capital
+# buys shares of ..."), listicles or promotional pieces. Add more in
+# config.NEWS_BLOCKED_SOURCES.
+LOW_VALUE_DOMAINS = {
+    "marketbeat.com", "defenseworld.net", "etfdailynews.com",
+    "tickerreport.com", "americanbankingnews.com", "themarketsdaily.com",
+    "thelincolnianonline.com", "modernreaders.com", "dailypolitical.com",
+    "thecerbatgem.com", "theenterpriseleader.com", "wkrb13.com",
+    "zolmax.com", "com-unik.info", "sportsperspectives.com",
+    "transcriptdaily.com", "stocknewstimes.com", "theolympiareport.com",
+    "insidermonkey.com", "simplywall.st", "zacks.com", "fool.com",
+    "fool.ca", "investorplace.com", "gurufocus.com", "247wallst.com",
+    "stocktitan.net", "marketscreener.com", "investing.com",
+    "financialcontent.com", "newsbreak.com", "msn.com",
+}
+LOW_VALUE_PUBLISHERS = {
+    "marketbeat", "insider monkey", "simply wall st", "simply wall st.",
+    "zacks", "zacks equity research", "motley fool", "the motley fool",
+    "investorplace", "gurufocus", "24/7 wall st.", "gurufocus.com",
+}
+# Sources ranked first when there are more headlines than space.
+PREFERRED_DOMAINS = {
+    "reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com",
+    "barrons.com", "marketwatch.com", "economist.com", "nytimes.com",
+    "lesechos.fr", "lefigaro.fr", "lemonde.fr", "afp.com",
+    "businesswire.com", "prnewswire.com", "globenewswire.com",
+    "spglobal.com", "essilorluxottica.com",
+}
+
+# Headlines that are filler rather than news.
+_FILLER_TITLE = re.compile(
+    # Fund-filing write-ups: "Shares Sold by X", "Stake in Y Lowered by X",
+    # "X Acquires New Stake in Y", "X Purchases 1,234 Shares of Y".
+    r"\b(?:shares|stake|position|holdings?)(?: (?:of|in) [^!?]{1,60}?)? "
+    r"(?:sold|bought|acquired|purchased|trimmed|raised|lowered|boosted|"
+    r"cut|increased|decreased|reduced|grew|lessened|upped) by\b"
+    r"|\b(?:acquires?|buys?|purchases?|takes?|makes?|establishes?|opens?)"
+    r" (?:a )?new (?:\$[\d.,]+[mbk]? )?(?:stake|position|investment)\b"
+    r"|\b(?:buys?|purchases?|sells?|acquires?) [\d,]+ shares\b"
+    r"|\b\d+ (?:reasons?|things?|stocks?|ways)\b"
+    r"|\bshould you (?:buy|sell|hold)\b|\bis it (?:time|too late) to\b"
+    r"|\b(?:stocks?|shares) to (?:buy|sell|watch|own)\b"
+    r"|\bbest (?:\w+ ){0,3}stocks?\b|\btop \d+\b"
+    r"|\bhere'?s (?:why|what|how)\b|\bprediction\b|\bprice prediction\b"
+    r"|\bstock (?:forecast|price target analysis)\b"
+    r"|\bunusual options activity\b|\bshort interest\b"
+    r"|\b(?:is|was) (?:\w+ ){0,3}(?:a buy|undervalued|overvalued)\b"
+    r"|\bvaluation (?:check|check-in)\b|\binsider (?:selling|buying)\b",
+    re.IGNORECASE,
+)
+
+
+def _source_blocked(h):
+    domain = _domain(h.get("url", ""))
+    publisher = str(h.get("publisher", "")).strip().lower()
+    blocked = {s.lower() for s in NEWS_BLOCKED_SOURCES}
+    if publisher in LOW_VALUE_PUBLISHERS or publisher in blocked:
+        return True
+    return any(
+        domain == d or domain.endswith("." + d)
+        for d in LOW_VALUE_DOMAINS | blocked
+    )
+
+
+def is_low_value(h):
+    """True for filler: filings spam, listicles and stock-tip pieces."""
+    return _source_blocked(h) or bool(_FILLER_TITLE.search(h.get("title", "")))
+
+
+def headline_key(h):
+    """A stable key for remembering a headline across runs."""
+    title = re.sub(r"[^a-z0-9]+", " ", str(h.get("title", "")).lower())
+    return "t:" + " ".join(title.split())[:120]
+
+
+def news_window_hours():
+    """
+    How far back to look for news: since the last report went out (so
+    Monday's report catches the weekend), and at least a day. Capped at a
+    week in case the report hasn't run for a while.
+    """
+    last = last_run_date()
+    if last is None:
+        return 72
+    since = datetime.now(MARKET_TZ) - MARKET_TZ.localize(
+        datetime.combine(last, datetime.min.time()).replace(hour=16)
+    )
+    return min(max(since.total_seconds() / 3600 + 6, 24), 7 * 24)
+
+
+def search_company_news(ticker, days, limit=10):
+    """Search the web for company news since the last report."""
     name = company_name(ticker)
     if "." in ticker or "^" in ticker:
         # Don't put exchange-suffixed tickers in the query; search engines
         # read "EL.PA" as "El Paso" and similar.
-        query = f'"{name}" shares company news'
+        query = f'"{name}" company news'
     else:
-        query = f'"{name}" ({ticker}) stock news'
-    return tavily_search(query, days=7, max_results=limit + 3)
-
-
-def gather_company_headlines(ticker, limit=5):
-    """
-    Headlines from the last week that are verifiably about this company,
-    newest first. Older items give the AI background when there's no
-    fresh news; each one carries its publication time.
-    """
-    candidates = get_headlines(ticker, limit=20) + search_company_news(
-        ticker, limit=limit
+        query = f'"{name}" ({ticker}) company news'
+    return tavily_search(
+        query, days=days, max_results=limit,
+        exclude_domains=sorted(LOW_VALUE_DOMAINS),
     )
-    relevant = [
-        h for h in candidates
-        if is_recent(h, 7 * 24)
+
+
+def gather_company_headlines(ticker, limit=8):
+    """
+    Headlines about this company that are new since the last report and
+    weren't shown before, with filler removed. Better sources come first.
+    """
+    hours = news_window_hours()
+    seen = {
+        s.get("key") for s in (get_run_state().get("seen") or {}).get(ticker, [])
+    }
+    candidates = get_headlines(ticker, limit=30) + search_company_news(
+        ticker, days=max(1, int(-(-hours // 24))),
+    )
+    fresh = [
+        h for h in dedupe_headlines(candidates)
+        if is_recent(h, hours)
         and mentions_company(ticker, f"{h['title']} {h.get('snippet', '')}")
+        and not is_low_value(h)
+        and headline_key(h) not in seen
+        and h.get("url") not in seen
     ]
-    dropped = len(candidates) - len(relevant)
-    if dropped:
-        print(f"{ticker}: dropped {dropped} stale or off-topic headlines")
-    return sort_by_recency(dedupe_headlines(relevant))[:limit]
+    print(
+        f"{ticker}: {len(fresh)} new headlines kept of {len(candidates)} "
+        f"found (last {hours:.0f}h)"
+    )
+    fresh = sort_by_recency(fresh)
+    fresh.sort(key=lambda h: not is_preferred_source(h))
+    return fresh[:limit]
 
 
-def gather_group(tickers, with_headlines=False, headline_limit=5):
+PREFERRED_PUBLISHERS = {
+    "reuters", "bloomberg", "financial times", "the wall street journal",
+    "wall street journal", "cnbc", "barron's", "marketwatch",
+    "associated press", "ap", "afp", "les echos", "le figaro",
+    "business wire", "pr newswire", "globenewswire", "dow jones",
+}
+
+
+def is_preferred_source(h):
+    # Yahoo-hosted stories carry the original outlet as the publisher.
+    publisher = str(h.get("publisher", "")).strip().lower()
+    return (publisher in PREFERRED_PUBLISHERS
+            or _from_domain(h.get("url", ""), PREFERRED_DOMAINS))
+
+
+def _fmt_target(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{value:,.0f}" if value >= 100 else f"{value:,.2f}"
+
+
+_GRADE_ACTIONS = {
+    "up": "upgrades", "down": "downgrades", "init": "initiates",
+    "main": "maintains", "reit": "reiterates",
+}
+
+
+def gather_analyst_actions(ticker):
+    """
+    Rating and price-target changes since the last report that weren't
+    shown before, newest first. Yahoo mostly covers U.S.-listed stocks.
+    """
+    last = last_run_date() or (market_today() - timedelta(days=3))
+    seen = {
+        s.get("key") for s in (get_run_state().get("seen") or {}).get(ticker, [])
+    }
+    try:
+        table = yf.Ticker(ticker).upgrades_downgrades
+    except Exception as e:
+        print(f"Analyst actions unavailable for {ticker}: {e}")
+        return []
+    if table is None or getattr(table, "empty", True):
+        return []
+
+    out = []
+    for when, row in table.iterrows():
+        try:
+            when = when.to_pydatetime() if hasattr(when, "to_pydatetime") else when
+            day = when.date() if isinstance(when, datetime) else when
+        except Exception:
+            continue
+        if not isinstance(day, date) or day < last:
+            continue
+        firm = str(row.get("Firm") or "").strip()
+        if not firm:
+            continue
+        action = str(row.get("Action") or "").strip().lower()
+        to_grade = str(row.get("ToGrade") or "").strip()
+        from_grade = str(row.get("FromGrade") or "").strip()
+        target = _fmt_target(row.get("currentPriceTarget"))
+        prior = _fmt_target(row.get("priorPriceTarget"))
+
+        verb = _GRADE_ACTIONS.get(action, action or "rates")
+        if action in ("up", "down") and from_grade:
+            text = f"{firm} {verb} to {to_grade} from {from_grade}"
+        elif to_grade:
+            text = f"{firm} {verb} {to_grade}"
+        else:
+            text = f"{firm} {verb} its rating"
+        if target and prior and target != prior:
+            text += f"; target {prior} → {target}"
+        elif target:
+            text += f"; target {target}"
+
+        key = f"a:{firm.lower()}|{action}|{to_grade.lower()}|{target}|{day}"
+        if key in seen:
+            continue
+        out.append({"text": text, "date": day, "key": key})
+
+    out.sort(key=lambda a: a["date"], reverse=True)
+    return dedupe_by_key(out)[:6]
+
+
+def dedupe_by_key(items):
+    known, out = set(), []
+    for item in items:
+        if item["key"] not in known:
+            known.add(item["key"])
+            out.append(item)
+    return out
+
+
+def gather_company_calendar(ticker):
+    """Next earnings date and next ex-dividend date, if known."""
+    today = market_today()
+    try:
+        cal = yf.Ticker(ticker).calendar
+    except Exception as e:
+        print(f"Calendar unavailable for {ticker}: {e}")
+        return {}
+    earnings = [d for d in extract_earnings_dates(cal) if d >= today]
+    ex_div = None
+    if isinstance(cal, dict):
+        raw = cal.get("Ex-Dividend Date")
+        if isinstance(raw, datetime):
+            raw = raw.date()
+        if isinstance(raw, date) and raw >= today:
+            ex_div = raw
+    return {
+        "next_earnings": min(earnings) if earnings else None,
+        "ex_dividend": ex_div,
+    }
+
+
+def gather_ticker_updates(row):
+    """Adds news, analyst actions and key dates to a tracked ticker's row."""
+    ticker = row["ticker"]
+    row["headlines"] = gather_company_headlines(ticker)
+    row["analyst_actions"] = gather_analyst_actions(ticker)
+    row["calendar"] = gather_company_calendar(ticker)
+    row["big_move"] = is_big_move(row)
+    # Benchmarks only matter for putting an unusual move in context.
+    row["benchmarks"] = gather_benchmarks(ticker) if row["big_move"] else []
+    return row
+
+
+def seen_items_for(tickers):
+    """Keys of everything shown today, saved so it isn't repeated."""
+    return {
+        r["ticker"]: [headline_key(h) for h in r.get("headlines", [])]
+        + [h["url"] for h in r.get("headlines", []) if h.get("url")]
+        + [a["key"] for a in r.get("analyst_actions", [])]
+        for r in tickers
+    }
+
+
+def gather_group(tickers, with_headlines=False):
     rows = []
     for ticker in tickers:
         quote = get_quote(ticker)
@@ -625,10 +939,7 @@ def gather_group(tickers, with_headlines=False, headline_limit=5):
             "headlines": [],
         }
         if with_headlines:
-            row["headlines"] = gather_company_headlines(
-                ticker, limit=headline_limit
-            )
-            row["benchmarks"] = gather_benchmarks(ticker)
+            gather_ticker_updates(row)
         rows.append(row)
     return rows
 
@@ -2051,60 +2362,86 @@ RULES
 # ---------------------------------------------------------------------------
 
 def build_ticker_notes(tickers):
-    if not tickers:
+    """
+    Turns each tracked ticker's new headlines into short news bullets, and
+    adds a short comment when the day's move was unusually large. Tickers
+    with no new headlines and an ordinary move skip the AI entirely.
+    """
+    needs_ai = [r for r in tickers if r["headlines"] or r.get("big_move")]
+    if not needs_ai:
         return {}
 
     lines = []
-    for r in tickers:
+    for r in needs_ai:
         lines.append(
-            f"\n{r['ticker']} — {r['name']} | daily {r['daily']:+.2f}% | "
-            f"YTD {r['ytd']:+.2f}%{_stale_tag(r)}"
+            f"\n{r['ticker']} — {r['name']} | today {r['daily']:+.2f}%"
+            f"{_stale_tag(r)}"
         )
-        bench = r.get("benchmarks") or []
-        if bench:
-            lines.append("  Benchmarks today: " + "; ".join(
-                f"{b['label']} ({b['ticker']}) {b['daily']:+.2f}%{_stale_tag(b)}"
-                for b in bench
-            ))
+        if r.get("big_move"):
+            typical = r.get("typical_move")
+            lines.append(
+                "  UNUSUAL MOVE: today's move is large for this stock"
+                + (f" (typical daily move about {typical:.1f}%)"
+                   if typical else "")
+            )
+            bench = r.get("benchmarks") or []
+            if bench:
+                lines.append("  Benchmarks today: " + "; ".join(
+                    f"{b['label']} {b['daily']:+.2f}%{_stale_tag(b)}"
+                    for b in bench
+                ))
+        actions = r.get("analyst_actions") or []
+        if actions:
+            lines.append("  Analyst actions (shown separately in the report): "
+                         + "; ".join(a["text"] for a in actions))
         if r["headlines"]:
-            lines += _fmt_headline_lines(r["headlines"], snippet_chars=300)
+            lines.append("  NEW HEADLINES (not shown in earlier reports):")
+            lines += _fmt_headline_lines(r["headlines"], snippet_chars=500)
         else:
-            lines.append("  (no recent company-specific headlines found)")
+            lines.append("  (no new headlines)")
 
     prompt = f"""
-You are writing the company-by-company review in a professional daily
-market review dated {_report_date()}, sent after the U.S. close. Price
-moves are today's close unless tagged "[last data ...]". Each ticker
-shows how its market and sector benchmarks moved today, and each
-headline shows its publication time (up to a week back).
+You are writing the tracked-companies section of a professional daily
+market review dated {_report_date()}, sent after the U.S. close. The
+reader follows these companies and wants to keep up with what is
+happening at each one. This is a news digest, not price commentary.
+Each headline below is new since the last report and shows its
+publication time.
 
-TRACKED TICKERS:
+TRACKED COMPANIES:
 {chr(10).join(lines)}
 
 Return JSON exactly in this shape:
-{{"tickers": {{"EL.PA": {{"note": "2-4 sentences", "cites": [1, 2]}}}}}}
+{{"tickers": {{"SPGI": {{"bullets": [{{"text": "one sentence", "cites": [1]}}],
+                        "move_note": ""}}}}}}
 
 RULES
-- Every ticker MUST get a note, keyed by its exact ticker.
-- The company is the one named after the ticker (e.g. EL.PA is
+- Include every ticker listed above, keyed by its exact ticker. The
+  company is the one named after the ticker (e.g. EL.PA is
   EssilorLuxottica). Never describe a different company.
-- Focus on today's company-specific developments: earnings, guidance,
-  products, regulation, analyst actions, industry news. Cite headline
-  numbers from that ticker's own list.
-- If nothing is from today, say there was no fresh company-specific news
-  today. Recent headlines from earlier in the week (for example, Friday's
-  news in a Monday report) are useful background: use them, and say when
-  they were published.
-- Always explain the move relative to its benchmarks. If the stock moved
-  roughly in line with its market or sector (within about 1 percentage
-  point), say it moved with the market or sector; that is an explanation,
-  not an unexplained move.
-- Only if the stock diverged from its benchmarks by roughly 1 point or
-  more and no headline accounts for it, say the divergence is unexplained
-  by the sources reviewed. Don't invent a company-specific cause from the
-  price move alone. Never fabricate events or sources.
+- bullets: one bullet per distinct, material development at the company
+  or directly affecting it: results, guidance, deals and M&A, products,
+  management or board changes, legal and regulatory matters, capital
+  returns, major contracts, and industry news that names the company.
+  Each bullet is one or two plain sentences saying what happened and, if
+  the source says so, why it matters. Start with the date in the form
+  "Mon Nov 24:". Cite the headline number(s) it comes from, from that
+  ticker's own list only.
+- Merge headlines about the same development into one bullet. Order
+  bullets by importance. At most 4 bullets per company.
+- Skip anything that isn't real news about the company: general market
+  wrap-ups that only mention it in passing, stock-tip or valuation
+  pieces, and recaps of the share price. It is fine, and expected on
+  many days, to return an empty bullets list.
+- Do not restate analyst actions; they are shown separately.
+- move_note: only for a ticker marked UNUSUAL MOVE, otherwise "". In 1-2
+  sentences, say what the headlines suggest drove the move; or, if the
+  benchmarks moved by a similar amount,
+  that it moved with the broader market; or, if neither, that no
+  company-specific cause was found in the coverage reviewed.
+- Use only the information above. Never invent events, figures or dates.
 """
-    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.3,
+    parsed = _groq_call(prompt, max_tokens=3500, temperature=0.2,
                         label="tickers")
     if not parsed:
         return {}
@@ -2114,17 +2451,25 @@ RULES
         raw = parsed
     entries = _keyed_entries(raw)
     notes = {}
-    for r in tickers:
+    for r in needs_ai:
         entry = entries.get(r["ticker"].upper())
-        if entry is None:
+        if not isinstance(entry, dict):
             continue
-        if isinstance(entry, dict):
-            notes[r["ticker"]] = {
-                "note": _text(_pick(entry, "note", "summary", "text")),
-                "cites": _clean_cites(_pick(entry, "cites", "sources")),
-            }
-        else:
-            notes[r["ticker"]] = {"note": _text(entry), "cites": []}
+        bullets = []
+        raw_bullets = _pick(entry, "bullets", "news", "items") or []
+        if isinstance(raw_bullets, (str, dict)):
+            raw_bullets = [raw_bullets]
+        for b in raw_bullets[:4]:
+            if isinstance(b, dict):
+                text = _text(_pick(b, "text", "summary", "bullet"))
+                cites = _clean_cites(_pick(b, "cites", "sources"))
+            else:
+                text, cites = _text(b), []
+            if text:
+                bullets.append({"text": text, "cites": cites})
+        move_note = _text(_pick(entry, "move_note", "move")) \
+            if r.get("big_move") else ""
+        notes[r["ticker"]] = {"bullets": bullets, "move_note": move_note}
     return notes
 
 
@@ -2639,6 +2984,14 @@ def _cited(headlines, cites):
     ]
 
 
+def _fmt_short_date(d):
+    return f"{d.strftime('%a %b')} {d.day}"
+
+
+def _fmt_price(value):
+    return f"{value:,.2f}"
+
+
 def build_ticker_review(tickers, ai):
     ticker_ai = ai.get("tickers", {})
     html = ""
@@ -2646,21 +2999,72 @@ def build_ticker_review(tickers, ai):
         entry = ticker_ai.get(row["ticker"], {})
         if not isinstance(entry, dict):
             entry = {}
-        note = str(entry.get("note", "") or "").strip()
+        bullets = entry.get("bullets") or []
+        move_note = str(entry.get("move_note", "") or "").strip()
+        actions = row.get("analyst_actions") or []
+        cal = row.get("calendar") or {}
 
         html += '<div class="ticker-review">'
         html += (
             f"<h2>{html_escape(row['ticker'])} — "
             f"{html_escape(row['name'])}</h2>"
         )
-        if note:
-            html += f"<p>{html_escape(note)}</p>"
-        cited = _cited(row["headlines"], entry.get("cites") or [])
-        if cited:
-            html += "<h3>Sources</h3>"
-            html += "".join(build_source_link(h) for h in cited)
+        stale = (f" (last data {row['as_of']:%b %d})"
+                 if row.get("stale") else "")
+        html += (
+            f'<p class="ticker-line">Closed {_fmt_price(row["price"])}, '
+            f"{_pct_span(row['daily'])} today{stale} · "
+            f"YTD {_pct_span(row['ytd'])}</p>"
+        )
+
+        if row.get("big_move"):
+            note = move_note or (
+                "Unusually large move for this stock; no explanation was "
+                "found in the coverage reviewed."
+            )
+            html += (f'<p class="move-flag"><strong>Unusual move.</strong> '
+                     f"{html_escape(note)}</p>")
+
+        items = []
+        for b in bullets:
+            cited = _cited(row["headlines"], b.get("cites") or [])
+            links = ", ".join(_inline_source(h) for h in cited)
+            items.append(
+                f"<li>{html_escape(b['text'])}"
+                + (f' <span class="source-inline">({links})</span>'
+                   if links else "")
+                + "</li>"
+            )
+        if items:
+            html += '<ul class="ticker-news">' + "".join(items) + "</ul>"
+        elif not row.get("big_move"):
+            html += ('<p class="quiet">No new company news since the last '
+                     "report.</p>")
+
+        if actions:
+            html += '<p class="ticker-meta"><strong>Analyst actions:</strong> '
+            html += "; ".join(
+                f"{html_escape(a['text'])} ({_fmt_short_date(a['date'])})"
+                for a in actions
+            ) + "</p>"
+
+        dates = []
+        if cal.get("next_earnings"):
+            dates.append(f"Next earnings: {_fmt_short_date(cal['next_earnings'])}")
+        if cal.get("ex_dividend"):
+            dates.append(f"Ex-dividend: {_fmt_short_date(cal['ex_dividend'])}")
+        if dates:
+            html += f'<p class="ticker-meta">{" · ".join(dates)}</p>'
         html += "</div>"
     return html or "<p>Unavailable.</p>"
+
+
+def _inline_source(h):
+    publisher = html_escape(h.get("publisher", "Source"))
+    url = h.get("url", "")
+    if url:
+        return f'<a href="{html_escape(url)}">{publisher}</a>'
+    return publisher
 
 
 def build_market_stories(market_news, ai):
@@ -2909,6 +3313,13 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 .negative { color: #b00000; }
 .neutral { color: #000; }
 .ticker-review { margin-bottom: 26px; }
+.ticker-line { margin-bottom: 8px; }
+.ticker-news { margin-top: 0; margin-bottom: 10px; }
+.source-inline { font-size: 12px; }
+.source-inline a { color: #000; text-decoration: underline; }
+.quiet { color: #444; font-style: italic; }
+.move-flag { border-left: 3px solid #000; padding-left: 10px; }
+.ticker-meta { font-size: 13px; color: #333; margin-bottom: 6px; }
 .source { font-size: 12px; margin-top: -4px; margin-bottom: 8px; }
 .source a { color: #000; text-decoration: underline; }
 .note { font-size: 12px; color: #444; margin-top: -4px; }
@@ -2995,7 +3406,7 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 <h2>Tracked Tickers</h2>
 {build_quote_table(tickers, include_price=True)}
 
-<h2>Company-by-Company Review</h2>
+<h2>Tracked Companies</h2>
 {build_ticker_review(tickers, ai)}
 
 <h1>3. Rates, Macro &amp; Cross-Asset</h1>
@@ -3186,7 +3597,7 @@ def main():
     send_email(subject=subject, html_body=html_body,
                images={"rates_chart": macro.get("rates_chart")})
     print(f"{REPORT_TITLE} email sent.")
-    mark_run_success()
+    mark_run_success(seen_items_for(tickers))
 
 
 if __name__ == "__main__":
