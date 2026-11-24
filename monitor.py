@@ -85,16 +85,28 @@ REPORT_AUTHOR = getattr(config, "REPORT_AUTHOR", "")
 READING_WPM = 230  # average adult reading speed for prose
 TICKER_KEYWORDS = getattr(config, "TICKER_KEYWORDS", {})
 
-# Portfolio definitions and weights.
+# Portfolio definitions and weights. The old config names (INDEX_PORTFOLIO,
+# PASSIVE_PORTFOLIO) still work as a fallback.
 PORTFOLIO_WEIGHTS = getattr(config, "PORTFOLIO_WEIGHTS", {})
-INDEX_PORTFOLIO = getattr(config, "INDEX_PORTFOLIO", [])
-INDEX_PORTFOLIO_WEIGHTS = getattr(config, "INDEX_PORTFOLIO_WEIGHTS", {})
-AVANTIS_PORTFOLIO = getattr(config, "AVANTIS_PORTFOLIO", [])
-AVANTIS_PORTFOLIO_WEIGHTS = getattr(config, "AVANTIS_PORTFOLIO_WEIGHTS", {})
+GROWTH_PORTFOLIO = getattr(config, "GROWTH_PORTFOLIO",
+                           getattr(config, "INDEX_PORTFOLIO", []))
+GROWTH_PORTFOLIO_WEIGHTS = getattr(config, "GROWTH_PORTFOLIO_WEIGHTS",
+                                   getattr(config, "INDEX_PORTFOLIO_WEIGHTS", {}))
+PASSIVE_PORTFOLIO = getattr(config, "PASSIVE_PORTFOLIO",
+                            getattr(config, "AVANTIS_PORTFOLIO", []))
+PASSIVE_PORTFOLIO_WEIGHTS = getattr(config, "PASSIVE_PORTFOLIO_WEIGHTS",
+                                    getattr(config, "AVANTIS_PORTFOLIO_WEIGHTS", {}))
 
-# Tickers shown side by side under "Canadian Comparison". This is a plain
-# comparison, not a portfolio, so it has no weights. Leave empty to hide it.
+# Tickers shown side by side as a plain comparison, not a portfolio, so it
+# has no weights. Leave empty to hide it.
 CANADIAN_COMPARISON = getattr(config, "CANADIAN_COMPARISON", [])
+
+# Section titles under "Portfolio Movements" (overridable in config.py).
+PORTFOLIO_TITLE = getattr(config, "PORTFOLIO_TITLE", "Factor Strategy (Current)")
+GROWTH_PORTFOLIO_TITLE = getattr(config, "GROWTH_PORTFOLIO_TITLE", "Growth Strategy")
+PASSIVE_PORTFOLIO_TITLE = getattr(config, "PASSIVE_PORTFOLIO_TITLE", "Passive Core")
+CANADIAN_COMPARISON_TITLE = getattr(config, "CANADIAN_COMPARISON_TITLE",
+                                    "Canadian Equity: Passive vs. Factor")
 
 # Earnings settings (overridable in config.py).
 RECENT_EARNINGS_LIMIT = getattr(config, "RECENT_EARNINGS_LIMIT", 6)
@@ -2922,7 +2934,7 @@ li { font-family: "Times New Roman", Times, serif; margin-bottom: 5px; }
 
 
 def compose_email(indices, sectors, factors, tickers, portfolio,
-                  index_portfolio, avantis_portfolio, canadian_comparison,
+                  growth_portfolio, passive_portfolio, canadian_comparison,
                   macro, market_news, lookahead, recent_earnings, earnings_notes, previews, ai):
 
     now = datetime.now(MARKET_TZ).strftime("%A, %B %d, %Y")
@@ -2947,9 +2959,9 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
 """
 
     portfolio_definitions = [
-        ("Index Portfolio", index_portfolio, INDEX_PORTFOLIO_WEIGHTS),
-        ("Avantis Portfolio", avantis_portfolio, AVANTIS_PORTFOLIO_WEIGHTS),
-        ("Current Portfolio", portfolio, PORTFOLIO_WEIGHTS),
+        (PORTFOLIO_TITLE, portfolio, PORTFOLIO_WEIGHTS),
+        (GROWTH_PORTFOLIO_TITLE, growth_portfolio, GROWTH_PORTFOLIO_WEIGHTS),
+        (PASSIVE_PORTFOLIO_TITLE, passive_portfolio, PASSIVE_PORTFOLIO_WEIGHTS),
     ]
     for name, rows, weights in portfolio_definitions:
         daily = calculate_weighted_portfolio_return(rows, "daily", weights)
@@ -2970,7 +2982,7 @@ def compose_email(indices, sectors, factors, tickers, portfolio,
         html += build_quote_table(rows, include_price=True)
 
     if canadian_comparison:
-        html += "<h3>Canadian Comparison</h3>"
+        html += f"<h3>{html_escape(CANADIAN_COMPARISON_TITLE)}</h3>"
         html += build_quote_table(canadian_comparison, include_price=True)
 
     html += f"""
@@ -3106,8 +3118,8 @@ def main():
 
     print("Gathering portfolios...")
     portfolio = gather_group(config.PORTFOLIO)
-    index_portfolio = gather_group(INDEX_PORTFOLIO)
-    avantis_portfolio = gather_group(AVANTIS_PORTFOLIO)
+    growth_portfolio = gather_group(GROWTH_PORTFOLIO)
+    passive_portfolio = gather_group(PASSIVE_PORTFOLIO)
     canadian_comparison = gather_group(CANADIAN_COMPARISON)
 
     print("Gathering sectors and factors...")
@@ -3126,8 +3138,8 @@ def main():
     print("Gathering lookahead...")
     lookahead = gather_lookahead()
 
-    if not (indices or tickers or portfolio or index_portfolio
-            or avantis_portfolio):
+    if not (indices or tickers or portfolio or growth_portfolio
+            or passive_portfolio):
         print("No data gathered — exiting without email.")
         return
 
@@ -3159,8 +3171,8 @@ def main():
         factors=factors,
         tickers=tickers,
         portfolio=portfolio,
-        index_portfolio=index_portfolio,
-        avantis_portfolio=avantis_portfolio,
+        growth_portfolio=growth_portfolio,
+        passive_portfolio=passive_portfolio,
         canadian_comparison=canadian_comparison,
         macro=macro,
         market_news=market_news,
