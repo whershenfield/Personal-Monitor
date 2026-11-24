@@ -84,8 +84,10 @@ Edit `config.py` to change what the report covers:
 
 - `INDICES`: indices shown in the dashboard.
 - `TICKERS`: individual stocks that get a company-by-company review.
-- `PORTFOLIO`, `INDEX_PORTFOLIO` and `AVANTIS_PORTFOLIO`: the holdings in each model portfolio.
-- `PORTFOLIO_WEIGHTS`, `INDEX_PORTFOLIO_WEIGHTS` and `AVANTIS_PORTFOLIO_WEIGHTS`: the weight of each holding in its portfolio.
+- `PORTFOLIO`, `GROWTH_PORTFOLIO` and `PASSIVE_PORTFOLIO`: the holdings in each model portfolio.
+- `PORTFOLIO_WEIGHTS`, `GROWTH_PORTFOLIO_WEIGHTS` and `PASSIVE_PORTFOLIO_WEIGHTS`: the weight of each holding in its portfolio.
+- `CANADIAN_COMPARISON`: tickers shown side by side with no weights. Leave as `[]` to hide.
+- `PORTFOLIO_TITLE`, `GROWTH_PORTFOLIO_TITLE`, `PASSIVE_PORTFOLIO_TITLE` and `CANADIAN_COMPARISON_TITLE`: the headings shown under Portfolio Movements.
 - `RATES_CHART_DAYS`: how many calendar days the Treasury yields chart covers (default 90). It can reach back no further than January 1 of the previous year.
 
 You can also add these optional settings to `config.py`:
