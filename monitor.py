@@ -1837,12 +1837,18 @@ def gather_upcoming_earnings():
                         if r["ticker"] in (ticker, base):
                             r["tracked"] = True
                 else:
+                    try:
+                        cap = float(
+                            yf.Ticker(ticker).fast_info.get("marketCap") or 0
+                        )
+                    except Exception:
+                        cap = 0.0
                     upcoming.append({
                         "ticker": ticker,
                         "name": company_name(ticker),
                         "date": d,
                         "timing": "Time n/a",
-                        "market_cap": 0.0,
+                        "market_cap": cap,
                         "eps_forecast": "",
                         "tracked": True,
                     })
@@ -2322,11 +2328,16 @@ COMPANIES:
 {chr(10).join(lines)}
 
 Return JSON exactly in this shape:
-{{"previews": [{{"ticker": "MSFT", "blurb": "one sentence",
-  "cites": [1]}}]}}
+{{"previews": [{{"ticker": "MSFT", "watch": "Azure growth",
+  "blurb": "one sentence", "cites": [1]}}]}}
 
 RULES
 - Write a preview for EVERY company listed.
+- "watch" is a 2-5 word noun phrase naming the ONE thing most likely to
+  move the stock (e.g. "data center guidance", "China demand", "margin
+  outlook"). No verbs, no full sentence, no trailing period.
+- Include "blurb" and "cites" ONLY for companies marked [TRACKED HOLDING];
+  omit both for every other company.
 - Each blurb is ONE sentence naming the ONE thing most likely to move
   the stock (a specific segment, metric, guidance item or issue raised in
   the preview coverage) and briefly why it matters. Don't list several
@@ -2349,9 +2360,11 @@ RULES
         if not isinstance(item, dict):
             item = {"blurb": item}
         blurb = _text(_pick(item, "blurb", "preview", "summary", "note"))
-        if blurb:
+        watch = _text(_pick(item, "watch", "focus", "key_item"))
+        if blurb or watch:
             out[ticker] = {
-                "blurb": blurb,
+                "watch": (watch or "").strip().rstrip("."),
+                "blurb": blurb or "",
                 "cites": _clean_cites(_pick(item, "cites", "sources")),
             }
     return out
@@ -3250,27 +3263,50 @@ def build_upcoming_earnings(upcoming, previews):
             "<p>No major earnings reports scheduled for the next two "
             "business days.</p>"
         )
+    # One compact line per company, in date order. Tracked holdings keep
+    # the fuller block (heading, one-sentence preview, sources) in place.
     html = ""
+    in_list = False
     for e in upcoming:
-        tracked = " — tracked holding" if e.get("tracked") else ""
-        html += '<div class="ticker-review">'
-        html += (
-            f"<h3>{html_escape(e['name'])} ({html_escape(e['ticker'])})"
-            f"{tracked}</h3>"
-        )
-        details = [f"{e['date'].strftime('%a %b %d')}, {e['timing'].lower()}"]
-        if e.get("market_cap"):
-            details.append(f"Mkt cap {format_cap(e['market_cap'])}")
-        html += f'<p class="note">{html_escape(" · ".join(details))}</p>'
+        preview = previews.get(e["ticker"].upper()) or {}
+        when = f"{e['date'].strftime('%a')}, {e['timing'].lower()}"
+        cap = format_cap(e["market_cap"]) if e.get("market_cap") else ""
 
-        preview = previews.get(e["ticker"].upper())
-        if preview:
-            html += f"<p>{html_escape(preview['blurb'])}</p>"
-            cited = _cited(e.get("headlines", []), preview["cites"])
-            html += "".join(build_source_link(h) for h in cited)
-        else:
-            html += "<p>Preview unavailable.</p>"
-        html += "</div>"
+        if e.get("tracked"):
+            if in_list:
+                html += "</ul>"
+                in_list = False
+            html += '<div class="ticker-review">'
+            html += (
+                f"<h3>{html_escape(e['name'])} ({html_escape(e['ticker'])})"
+                " — tracked holding</h3>"
+            )
+            details = [when] + ([f"Mkt cap {cap}"] if cap else [])
+            html += f'<p class="note">{html_escape(" · ".join(details))}</p>'
+            blurb = preview.get("blurb") or preview.get("watch")
+            if blurb:
+                html += f"<p>{html_escape(blurb)}</p>"
+                cited = _cited(e.get("headlines", []), preview.get("cites", []))
+                html += "".join(build_source_link(h) for h in cited)
+            else:
+                html += "<p>Preview unavailable.</p>"
+            html += "</div>"
+            continue
+
+        if not in_list:
+            html += '<ul class="earnings-list">'
+            in_list = True
+        line = (
+            f"<b>{html_escape(when)} · {html_escape(e['name'])} "
+            f"({html_escape(e['ticker'])})</b>"
+        )
+        if cap:
+            line += f" · {html_escape(cap)}"
+        if preview.get("watch"):
+            line += f" — {html_escape(preview['watch'])}"
+        html += f"<li>{line}</li>"
+    if in_list:
+        html += "</ul>"
     return html
 
 
