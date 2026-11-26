@@ -475,6 +475,25 @@ def company_name(ticker):
 
 
 @lru_cache(maxsize=None)
+def company_profile(ticker):
+    """Return Yahoo's industry and business description for a company.
+
+    Used to tell the reader what an unfamiliar company does. Returns
+    empty strings if Yahoo has nothing, so callers never need to guard.
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception as e:
+        print(f"Profile lookup failed for {ticker}: {e}")
+        return {"industry": "", "summary": ""}
+    industry = str(info.get("industry") or info.get("sector") or "").strip()
+    summary = " ".join(str(info.get("longBusinessSummary") or "").split())
+    if len(summary) > 600:
+        summary = summary[:600].rsplit(" ", 1)[0] + "..."
+    return {"industry": industry, "summary": summary}
+
+
+@lru_cache(maxsize=None)
 def company_keywords(ticker):
     custom = TICKER_KEYWORDS.get(ticker) or DEFAULT_TICKER_KEYWORDS.get(ticker)
     if custom:
@@ -2231,6 +2250,12 @@ def build_earnings_summary(recent):
             f"EPS actual {c.get('eps_actual') or 'n/a'} | "
             f"surprise {c.get('surprise') or 'n/a'} | {c['reaction_note']}"
         )
+        profile = company_profile(c["ticker"])
+        if profile["industry"] or profile["summary"]:
+            lines.append(
+                f"  Business: {profile['industry'] or 'n/a'}. "
+                f"{profile['summary']}"
+            )
         if c["headlines"]:
             lines += _fmt_headline_lines(c["headlines"], snippet_chars=450)
         else:
@@ -2253,7 +2278,8 @@ COMPANIES THAT REPORTED (largest first):
 
 Return JSON exactly in this shape:
 {{"recent_earnings": [{{"ticker": "MSFT", "company": "Microsoft",
-  "blurb": "3-5 sentences", "cites": [1, 2]}}]}}
+  "profile": "one short sentence", "blurb": "3-4 sentences",
+  "cites": [1, 2]}}]}}
 
 RULES
 - One entry per listed company that has results coverage. If GENERAL
@@ -2262,8 +2288,30 @@ RULES
   open or after today's close; their cites refer to that list. Do not add
   companies that reported on an earlier day, including after the previous
   day's close, since those were covered in the previous report.
-- Each blurb: EPS and revenue versus expectations, guidance, the key
-  business driver(s), and the stock reaction given above.
+- Each profile: ONE plain-English sentence of no more than 20 words
+  saying what the company does, written for a reader who has never heard
+  of it (e.g. "Makes enterprise software for managing HR and payroll.").
+  Name its main products or customers, not its history, headquarters or
+  results. Base it on the Business line where supplied; otherwise use
+  well-established facts about the company. No figures.
+- Each blurb explains WHY THE STOCK MOVED. Write it in this order:
+  1. Open with the stock reaction given above and the main reason for
+     it, in plain words (e.g. "Shares fell 6% after hours as a weak
+     holiday-quarter outlook overshadowed a solid beat.").
+  2. One sentence of headline results: EPS and revenue versus
+     expectations, and whether guidance was raised, held or cut.
+  3. One or two sentences on what drove the reaction: the specific
+     segment, metric, guidance change, management comment or concern
+     that investors focused on, and why it matters for the business.
+- Keep numbers to the essentials: EPS and revenue versus expectations,
+  the guidance change, and at most one or two other figures that
+  directly explain the move. Leave out secondary metrics (margins to the
+  decimal, segment-by-segment revenue, share counts, prior-year
+  comparisons) unless one of them is the reason the stock moved.
+- If the coverage doesn't say why the stock moved, say the results and
+  note that the reason for the move wasn't clear from coverage. Don't
+  invent a reason.
+- Don't repeat the profile in the blurb.
 - For companies that reported after today's close, the after-hours move
   is the earnings reaction; today's regular-session move happened before
   the results and should not be described as a reaction to them. Call
@@ -2291,6 +2339,8 @@ RULES
         out.append({
             "ticker": ticker,
             "company": _text(_pick(item, "company", "name")),
+            "profile": _text(_pick(item, "profile", "description",
+                                   "business")),
             "blurb": blurb,
             "cites": _clean_cites(_pick(item, "cites", "sources")),
         })
@@ -3233,6 +3283,14 @@ def build_earnings_recap(recent, earnings_notes):
         html += (
             f"<h2>{html_escape(name)} ({html_escape(e['ticker'])})</h2>"
         )
+        # One line on what the company does. If the AI didn't supply one
+        # (e.g. the recap request failed), fall back to Yahoo's industry.
+        profile = e.get("profile") or ""
+        if not profile and c:
+            industry = company_profile(c["ticker"])["industry"]
+            profile = f"Industry: {industry}" if industry else ""
+        if profile:
+            html += f'<p class="note"><em>{html_escape(profile)}</em></p>'
         if c:
             details = [f"Reported {c['date'].strftime('%b %d')}, "
                        f"{c['timing'].lower()}"]
